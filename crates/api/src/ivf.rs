@@ -6,6 +6,18 @@ use std::arch::x86_64::*;
 
 const NPROBE_DEFAULT: usize = 8;
 pub const FIX_SCALE: f32 = 10_000.0;
+const MAX_K: usize = 4096;
+const BITSET_WORDS: usize = (MAX_K + 63) / 64;
+
+#[inline(always)]
+fn bitset_set(bs: &mut [u64; BITSET_WORDS], i: usize) {
+    bs[i >> 6] |= 1u64 << (i & 63);
+}
+
+#[inline(always)]
+fn bitset_get(bs: &[u64; BITSET_WORDS], i: usize) -> bool {
+    (bs[i >> 6] >> (i & 63)) & 1 == 1
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Top5 {
@@ -53,17 +65,17 @@ pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, nprobe: usize) -> u8
     let mut top5 = [SENTINEL; 5];
     let mut worst_idx = 0usize;
 
-    let mut scanned = vec![false; ds.k];
+    let mut scanned = [0u64; BITSET_WORDS];
 
     for &c in probes[..n].iter() {
-        if !scanned[c] {
-            scanned[c] = true;
+        if !bitset_get(&scanned, c) {
+            bitset_set(&mut scanned, c);
             scan_cluster(c, &q_i16, ds, &mut top5, &mut worst_idx);
         }
     }
 
     for c in 0..ds.k {
-        if scanned[c] {
+        if bitset_get(&scanned, c) {
             continue;
         }
         let lb = bbox_lower_bound(&q_i16, ds, c);
@@ -252,6 +264,94 @@ fn try_insert_top5(top5: &mut [Top5; 5], worst_idx: &mut usize, d: i64, label: u
 
 pub fn nprobe_default() -> usize {
     NPROBE_DEFAULT
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SearchTrace {
+    pub phase3_lb_checks: u32,
+    pub phase3_scans_extra: u32,
+    pub phase1_2_ns: u64,
+    pub phase3_ns: u64,
+    pub total_ns: u64,
+}
+
+pub fn search_fraud_count_traced(
+    query: &[f32; DIM],
+    ds: &Dataset,
+    nprobe: usize,
+) -> (u8, SearchTrace) {
+    let t_total = std::time::Instant::now();
+    let t_p12 = std::time::Instant::now();
+
+    let mut q_i16 = [0i16; DIM];
+    for j in 0..DIM {
+        q_i16[j] = quantize_i16(query[j]);
+    }
+
+    let nprobe = nprobe.clamp(1, ds.k);
+    let mut probes = [0usize; 64];
+    let mut probe_d = [f32::INFINITY; 64];
+    let n = nprobe.min(probes.len());
+    for c in 0..ds.k {
+        let d = centroid_dist_sq(query, ds, c);
+        if d < probe_d[n - 1] {
+            let mut pos = n - 1;
+            while pos > 0 && d < probe_d[pos - 1] {
+                pos -= 1;
+            }
+            let mut i = n - 1;
+            while i > pos {
+                probe_d[i] = probe_d[i - 1];
+                probes[i] = probes[i - 1];
+                i -= 1;
+            }
+            probe_d[pos] = d;
+            probes[pos] = c;
+        }
+    }
+
+    let mut top5 = [SENTINEL; 5];
+    let mut worst_idx = 0usize;
+    let mut scanned = [0u64; BITSET_WORDS];
+
+    for &c in probes[..n].iter() {
+        if !bitset_get(&scanned, c) {
+            bitset_set(&mut scanned, c);
+            scan_cluster(c, &q_i16, ds, &mut top5, &mut worst_idx);
+        }
+    }
+
+    let phase1_2_ns = t_p12.elapsed().as_nanos() as u64;
+    let t_p3 = std::time::Instant::now();
+
+    let mut lb_checks: u32 = 0;
+    let mut scans_extra: u32 = 0;
+    for c in 0..ds.k {
+        if bitset_get(&scanned, c) {
+            continue;
+        }
+        lb_checks += 1;
+        let lb = bbox_lower_bound(&q_i16, ds, c);
+        if lb <= top5[worst_idx].dist {
+            scans_extra += 1;
+            scan_cluster(c, &q_i16, ds, &mut top5, &mut worst_idx);
+        }
+    }
+
+    let phase3_ns = t_p3.elapsed().as_nanos() as u64;
+    let total_ns = t_total.elapsed().as_nanos() as u64;
+
+    let fraud_count = top5.iter().map(|e| e.label as u8).sum::<u8>();
+    (
+        fraud_count.min(5),
+        SearchTrace {
+            phase3_lb_checks: lb_checks,
+            phase3_scans_extra: scans_extra,
+            phase1_2_ns,
+            phase3_ns,
+            total_ns,
+        },
+    )
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@ use memchr::memmem;
 const POST_FRAUD: &[u8] = b"POST /fraud-score";
 const GET_READY: &[u8] = b"GET /ready";
 const CONTENT_LENGTH: &[u8] = b"content-length:";
+const CONTENT_LENGTH_LOWER: &[u8] = b"content-length:";
+const CONTENT_LENGTH_TITLE: &[u8] = b"Content-Length:";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Parsed {
@@ -101,32 +103,43 @@ fn find_content_length(headers: &[u8]) -> Option<usize> {
         return None;
     }
 
+    if let Some(off) = memchr::memmem::find(headers, CONTENT_LENGTH_LOWER) {
+        return read_value_after(headers, off + key_len);
+    }
+    if let Some(off) = memchr::memmem::find(headers, CONTENT_LENGTH_TITLE) {
+        return read_value_after(headers, off + key_len);
+    }
+
     let mut i = 0usize;
     while i + key_len <= headers.len() {
         if header_eq_ascii_ci(&headers[i..i + key_len], CONTENT_LENGTH) {
-            let mut p = i + key_len;
-            while p < headers.len() && (headers[p] == b' ' || headers[p] == b'\t') {
-                p += 1;
-            }
-            let mut v = 0usize;
-            let mut digits = 0;
-            while p < headers.len() && headers[p].is_ascii_digit() {
-                v = v.wrapping_mul(10).wrapping_add((headers[p] - b'0') as usize);
-                p += 1;
-                digits += 1;
-            }
-            if digits == 0 {
-                return None;
-            }
-            return Some(v);
+            return read_value_after(headers, i + key_len);
         }
-
         match memchr::memchr(b'\n', &headers[i..]) {
             Some(off) => i += off + 1,
             None => return None,
         }
     }
     None
+}
+
+#[inline(always)]
+fn read_value_after(headers: &[u8], start: usize) -> Option<usize> {
+    let mut p = start;
+    while p < headers.len() && (headers[p] == b' ' || headers[p] == b'\t') {
+        p += 1;
+    }
+    let mut v = 0usize;
+    let mut digits = 0;
+    while p < headers.len() && headers[p].is_ascii_digit() {
+        v = v.wrapping_mul(10).wrapping_add((headers[p] - b'0') as usize);
+        p += 1;
+        digits += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    Some(v)
 }
 
 #[inline(always)]

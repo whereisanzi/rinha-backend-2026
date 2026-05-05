@@ -1,4 +1,16 @@
 use memchr::memmem;
+use std::sync::LazyLock;
+
+static F_TRANSACTION: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(KEY_TRANSACTION));
+static F_CUSTOMER: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(KEY_CUSTOMER));
+static F_MERCHANT: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(KEY_MERCHANT));
+static F_TERMINAL: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(KEY_TERMINAL));
+static F_LAST_TX: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(KEY_LAST_TX));
 
 #[derive(Debug)]
 pub struct LastTx<'a> {
@@ -29,10 +41,10 @@ const KEY_TERMINAL: &[u8] = b"\"terminal\"";
 const KEY_LAST_TX: &[u8] = b"\"last_transaction\"";
 
 pub fn parse(body: &[u8]) -> Option<Payload<'_>> {
-    let transaction = find_object(body, KEY_TRANSACTION)?;
-    let customer = find_object(body, KEY_CUSTOMER)?;
-    let merchant = find_object(body, KEY_MERCHANT)?;
-    let terminal = find_object(body, KEY_TERMINAL)?;
+    let transaction = find_object_with(body, KEY_TRANSACTION, &F_TRANSACTION)?;
+    let customer = find_object_with(body, KEY_CUSTOMER, &F_CUSTOMER)?;
+    let merchant = find_object_with(body, KEY_MERCHANT, &F_MERCHANT)?;
+    let terminal = find_object_with(body, KEY_TERMINAL, &F_TERMINAL)?;
 
     let merchant_id = obj_string(merchant, b"\"id\"")?;
     let merchant_mcc = obj_string(merchant, b"\"mcc\"")?;
@@ -125,13 +137,36 @@ fn matching_brace(buf: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-fn find_object<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    let p = find_value_start(buf, key)?;
+fn find_object_with<'a>(
+    buf: &'a [u8],
+    key: &[u8],
+    finder: &memmem::Finder<'static>,
+) -> Option<&'a [u8]> {
+    let p = find_value_start_with(buf, key, finder)?;
     if buf.get(p)? != &b'{' {
         return None;
     }
     let end = matching_brace(buf, p)?;
     Some(&buf[p + 1..end])
+}
+
+fn find_value_start_with(
+    buf: &[u8],
+    key: &[u8],
+    finder: &memmem::Finder<'static>,
+) -> Option<usize> {
+    let pos = finder.find(buf)?;
+    let mut p = pos + key.len();
+    p = skip_ws(buf, p);
+    if buf.get(p)? != &b':' {
+        return None;
+    }
+    p += 1;
+    p = skip_ws(buf, p);
+    if p >= buf.len() {
+        return None;
+    }
+    Some(p)
 }
 
 fn obj_string<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
@@ -217,7 +252,7 @@ fn skip_array_ws_comma(buf: &[u8], mut i: usize) -> usize {
 }
 
 fn parse_last_tx(body: &[u8]) -> Option<Option<LastTx<'_>>> {
-    let p = find_value_start(body, KEY_LAST_TX)?;
+    let p = find_value_start_with(body, KEY_LAST_TX, &F_LAST_TX)?;
     if body[p..].starts_with(b"null") {
         return Some(None);
     }

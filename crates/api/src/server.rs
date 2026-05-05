@@ -107,11 +107,14 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
         push_accept(&mut ring, listen_fd);
     }
 
+    let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(RING_QD as usize);
+
     loop {
         ring.submit_and_wait(1)?;
 
-        let cqes: Vec<_> = ring.completion().collect();
-        for cqe in cqes {
+        cqes.clear();
+        cqes.extend(ring.completion());
+        for cqe in cqes.drain(..) {
             let ud = cqe.user_data();
             let res = cqe.result();
             match unpack_op(ud) {
