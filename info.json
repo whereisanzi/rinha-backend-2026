@@ -1,0 +1,7 @@
+{
+    "participants": ["Anderson Anzileiro"],
+    "social": ["https://github.com/whereisanzi"],
+    "source-code-repo": "https://github.com/whereisanzi/rinha-backend-2026",
+    "stack": ["rust", "io_uring", "epoll", "musl", "scratch"],
+    "open_to_work": true
+}

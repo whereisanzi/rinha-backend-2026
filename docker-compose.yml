@@ -1,0 +1,88 @@
+services:
+  lb:
+    image: ghcr.io/whereisanzi/rinha-lb:75c3778
+    ports:
+      - "9999:9999"
+    environment:
+      - PORT=9999
+      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
+      - BUF_SIZE=4096
+      - BACKLOG=4096
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "60M"
+
+  api1:
+    image: ghcr.io/whereisanzi/rinha-api:75c3778
+    environment:
+      - INDEX_PATH=/resources/index.bin
+      - UDS_PATH=/sockets/api1.sock
+      - UDS_MODE=438
+      - NPROBE=1
+      - BACKLOG=4096
+    volumes:
+      - sockets:/sockets
+      - resources:/resources
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "145M"
+
+  api2:
+    image: ghcr.io/whereisanzi/rinha-api:75c3778
+    environment:
+      - INDEX_PATH=/resources/index.bin
+      - UDS_PATH=/sockets/api2.sock
+      - UDS_MODE=438
+      - NPROBE=1
+      - BACKLOG=4096
+    volumes:
+      - sockets:/sockets
+      - resources:/resources:ro
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "145M"
+    depends_on:
+      - api1
+
+volumes:
+  sockets:
+  resources:
+
+networks:
+  rinha-net:
+    driver: bridge
