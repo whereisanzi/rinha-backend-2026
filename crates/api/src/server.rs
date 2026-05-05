@@ -1,6 +1,5 @@
-
-
 use std::ffi::CString;
+use std::mem;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::ptr;
@@ -14,13 +13,19 @@ use crate::{ivf, json, responses, vectorizer};
 
 const REQ_BUF_SIZE: usize = 4096;
 const RING_QD: u32 = 4096;
-const ACCEPT_QD: usize = 32;
+const ACCEPT_QD: usize = 8;
+const MAX_CTRL: usize = 16;
 const MAX_CONNS: usize = 1024;
 const PREWARM_ITERS: usize = 200;
 
+const CQE_F_MORE: u32 = 1 << 1;
+
 const OP_ACCEPT: u8 = 1;
-const OP_RECV: u8 = 2;
-const OP_SEND: u8 = 3;
+const OP_RECVMSG: u8 = 2;
+const OP_RECV: u8 = 3;
+const OP_SEND: u8 = 4;
+
+const KIND_CTRL_BIT: u32 = 0x8000_0000;
 
 const GEN_MASK: u64 = 0x00ff_ffff;
 const GEN_SHIFT: u32 = 32;
@@ -76,6 +81,34 @@ impl Conn {
     }
 }
 
+#[repr(C)]
+struct CtrlConn {
+    in_use: bool,
+    fd: RawFd,
+    generation: u32,
+    payload: u8,
+    iov: libc::iovec,
+    msg: libc::msghdr,
+    cmsg_buf: [u8; 64],
+}
+
+impl CtrlConn {
+    fn new() -> Self {
+        Self {
+            in_use: false,
+            fd: -1,
+            generation: 0,
+            payload: 0,
+            iov: libc::iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            },
+            msg: unsafe { mem::zeroed() },
+            cmsg_buf: [0u8; 64],
+        }
+    }
+}
+
 pub struct Config {
     pub uds_path: String,
     pub uds_mode: u32,
@@ -84,7 +117,6 @@ pub struct Config {
 }
 
 pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
-
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
@@ -92,7 +124,10 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
     prewarm(ds, cfg.nprobe);
 
     let listen_fd = bind_uds(&cfg.uds_path, cfg.uds_mode, cfg.backlog)?;
-    eprintln!("listening on {} (qd={}, nprobe={})", cfg.uds_path, RING_QD, cfg.nprobe);
+    eprintln!(
+        "listening on {} (qd={}, nprobe={}, scm_rights handoff)",
+        cfg.uds_path, RING_QD, cfg.nprobe
+    );
 
     let mut ring: IoUring = IoUring::builder()
         .setup_single_issuer()
@@ -100,8 +135,11 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
         .build(RING_QD)?;
 
     let mut conns: Vec<Conn> = (0..MAX_CONNS).map(|_| Conn::new()).collect();
+    let mut free_conn_slots: Vec<u32> = (0..MAX_CONNS as u32).rev().collect();
 
-    let mut free_slots: Vec<u32> = (0..MAX_CONNS as u32).rev().collect();
+    let mut ctrls: Vec<Box<CtrlConn>> =
+        (0..MAX_CTRL).map(|_| Box::new(CtrlConn::new())).collect();
+    let mut free_ctrl_slots: Vec<u32> = (0..MAX_CTRL as u32).rev().collect();
 
     for _ in 0..ACCEPT_QD {
         push_accept(&mut ring, listen_fd);
@@ -117,20 +155,59 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
         for cqe in cqes.drain(..) {
             let ud = cqe.user_data();
             let res = cqe.result();
+            let _flags = cqe.flags();
             match unpack_op(ud) {
-                OP_ACCEPT => handle_accept(&mut ring, listen_fd, res, &mut conns, &mut free_slots),
+                OP_ACCEPT => handle_accept(
+                    &mut ring,
+                    listen_fd,
+                    res,
+                    &mut ctrls,
+                    &mut free_ctrl_slots,
+                ),
+                OP_RECVMSG => {
+                    let raw_slot = unpack_slot(ud);
+                    let slot = (raw_slot & !KIND_CTRL_BIT) as usize;
+                    let gen_id = unpack_gen(ud);
+                    if ctrls[slot].in_use && ctrls[slot].generation == gen_id {
+                        handle_recvmsg(
+                            &mut ring,
+                            slot,
+                            res,
+                            &mut ctrls,
+                            &mut free_ctrl_slots,
+                            &mut conns,
+                            &mut free_conn_slots,
+                        );
+                    }
+                }
                 OP_RECV => {
                     let slot = unpack_slot(ud) as usize;
                     let gen_id = unpack_gen(ud);
                     if conns[slot].generation == gen_id {
-                        handle_recv(&mut ring, slot, res, &mut conns, &mut free_slots, ds, cfg.nprobe);
+                        handle_recv(
+                            &mut ring,
+                            slot,
+                            res,
+                            &mut conns,
+                            &mut free_conn_slots,
+                            ds,
+                            cfg.nprobe,
+                        );
                     }
                 }
                 OP_SEND => {
                     let slot = unpack_slot(ud) as usize;
                     let gen_id = unpack_gen(ud);
                     if conns[slot].generation == gen_id {
-                        handle_send(&mut ring, slot, res, &mut conns, &mut free_slots, ds, cfg.nprobe);
+                        handle_send(
+                            &mut ring,
+                            slot,
+                            res,
+                            &mut conns,
+                            &mut free_conn_slots,
+                            ds,
+                            cfg.nprobe,
+                        );
                     }
                 }
                 _ => {}
@@ -140,7 +217,6 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
 }
 
 fn prewarm(ds: &'static Dataset, nprobe: usize) {
-
     let legit = br#"{"id":"x","transaction":{"amount":41.12,"installments":2,"requested_at":"2026-03-11T18:45:53Z"},"customer":{"avg_amount":82.24,"tx_count_24h":3,"known_merchants":["MERC-016"]},"merchant":{"id":"MERC-016","mcc":"5411","avg_amount":60.25},"terminal":{"is_online":false,"card_present":true,"km_from_home":29.23},"last_transaction":null}"#;
     let fraud = br#"{"id":"x","transaction":{"amount":9505.97,"installments":10,"requested_at":"2026-03-14T05:15:12Z"},"customer":{"avg_amount":81.28,"tx_count_24h":20,"known_merchants":["MERC-A"]},"merchant":{"id":"MERC-068","mcc":"7802","avg_amount":54.86},"terminal":{"is_online":false,"card_present":true,"km_from_home":952.27},"last_transaction":null}"#;
 
@@ -171,7 +247,7 @@ fn bind_uds(path: &str, mode: u32, backlog: i32) -> std::io::Result<RawFd> {
         return Err(std::io::Error::last_os_error());
     }
 
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_bytes();
     if bytes.len() >= addr.sun_path.len() {
@@ -186,7 +262,7 @@ fn bind_uds(path: &str, mode: u32, backlog: i32) -> std::io::Result<RawFd> {
     for (i, &b) in bytes.iter().enumerate() {
         addr.sun_path[i] = b as libc::c_char;
     }
-    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    let addr_len = (mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
 
     if unsafe { libc::bind(fd, &addr as *const _ as *const _, addr_len) } < 0 {
         unsafe {
@@ -227,6 +303,27 @@ fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {
     push_sqe(ring, entry);
 }
 
+fn setup_recvmsg(c: &mut CtrlConn) {
+    c.iov.iov_base = &mut c.payload as *mut _ as *mut libc::c_void;
+    c.iov.iov_len = 1;
+    c.msg.msg_name = ptr::null_mut();
+    c.msg.msg_namelen = 0;
+    c.msg.msg_iov = &mut c.iov as *mut _;
+    c.msg.msg_iovlen = 1;
+    c.msg.msg_control = c.cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    c.msg.msg_controllen = c.cmsg_buf.len() as _;
+    c.msg.msg_flags = 0;
+}
+
+fn push_recvmsg(ring: &mut IoUring, slot: usize, ctrl: &mut CtrlConn) {
+    setup_recvmsg(ctrl);
+    let raw_slot = (slot as u32) | KIND_CTRL_BIT;
+    let entry = opcode::RecvMsg::new(types::Fd(ctrl.fd), &mut ctrl.msg as *mut _)
+        .build()
+        .user_data(pack(OP_RECVMSG, ctrl.generation, raw_slot));
+    push_sqe(ring, entry);
+}
+
 fn push_recv(ring: &mut IoUring, slot: u32, conn: &mut Conn) {
     let buf_ptr = unsafe { conn.req_buf.as_mut_ptr().add(conn.req_len) };
     let buf_len = (REQ_BUF_SIZE - conn.req_len) as u32;
@@ -258,21 +355,33 @@ fn close_conn(slot: usize, conns: &mut [Conn], free_slots: &mut Vec<u32>) {
     free_slots.push(slot as u32);
 }
 
+fn close_ctrl(slot: usize, ctrls: &mut [Box<CtrlConn>], free_slots: &mut Vec<u32>) {
+    let c = &mut ctrls[slot];
+    if c.fd >= 0 {
+        unsafe {
+            libc::close(c.fd);
+        }
+    }
+    c.fd = -1;
+    c.in_use = false;
+    c.generation = c.generation.wrapping_add(1) & (GEN_MASK as u32);
+    free_slots.push(slot as u32);
+}
+
 fn handle_accept(
     ring: &mut IoUring,
     listen_fd: RawFd,
     res: i32,
-    conns: &mut [Conn],
-    free_slots: &mut Vec<u32>,
+    ctrls: &mut [Box<CtrlConn>],
+    free_ctrl_slots: &mut Vec<u32>,
 ) {
-
     push_accept(ring, listen_fd);
 
     if res < 0 {
         return;
     }
-    let new_fd = res;
-    let slot = match free_slots.pop() {
+    let new_fd = res as RawFd;
+    let slot = match free_ctrl_slots.pop() {
         Some(s) => s as usize,
         None => {
             unsafe {
@@ -281,10 +390,64 @@ fn handle_accept(
             return;
         }
     };
-    let conn = &mut conns[slot];
-    conn.fd = new_fd;
-    conn.reset_state();
-    push_recv(ring, slot as u32, conn);
+    let c = &mut ctrls[slot];
+    c.in_use = true;
+    c.fd = new_fd;
+    c.generation = c.generation.wrapping_add(1) & (GEN_MASK as u32);
+    push_recvmsg(ring, slot, c);
+}
+
+fn extract_fd(msg: &libc::msghdr) -> Option<RawFd> {
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(msg);
+        if cmsg.is_null() {
+            return None;
+        }
+        if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+            return None;
+        }
+        let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+        Some(ptr::read_unaligned(data))
+    }
+}
+
+fn handle_recvmsg(
+    ring: &mut IoUring,
+    slot: usize,
+    res: i32,
+    ctrls: &mut [Box<CtrlConn>],
+    free_ctrl_slots: &mut Vec<u32>,
+    conns: &mut [Conn],
+    free_conn_slots: &mut Vec<u32>,
+) {
+    if res <= 0 {
+        close_ctrl(slot, ctrls, free_ctrl_slots);
+        return;
+    }
+    let received = extract_fd(&ctrls[slot].msg);
+
+    let ctrl = &mut ctrls[slot];
+    push_recvmsg(ring, slot, ctrl);
+
+    let client_fd = match received {
+        Some(fd) if fd >= 0 => fd,
+        _ => return,
+    };
+
+    let conn_slot = match free_conn_slots.pop() {
+        Some(s) => s as usize,
+        None => {
+            unsafe {
+                libc::close(client_fd);
+            }
+            return;
+        }
+    };
+    let c = &mut conns[conn_slot];
+    c.fd = client_fd;
+    c.generation = c.generation.wrapping_add(1) & (GEN_MASK as u32);
+    c.reset_state();
+    push_recv(ring, conn_slot as u32, c);
 }
 
 fn handle_recv(
@@ -300,7 +463,6 @@ fn handle_recv(
         return;
     }
     if res <= 0 {
-
         close_conn(slot, conns, free_slots);
         return;
     }
@@ -357,7 +519,6 @@ fn drive(
     match parsed {
         Parsed::Incomplete => {
             if conns[slot].req_len >= REQ_BUF_SIZE - 1 {
-
                 push_close_response(ring, slot, conns, responses::RESP_PAYLOAD_TOO_LARGE);
                 return;
             }
@@ -379,7 +540,6 @@ fn drive(
             body_end,
             consumed,
         } => {
-
             let frauds_or_bad = {
                 let body = &conns[slot].req_buf[body_start..body_end];
                 match json::parse(body) {
@@ -437,4 +597,9 @@ fn advance_buf(conn: &mut Conn, consumed: usize) {
         conn.req_buf.copy_within(consumed..consumed + remaining, 0);
     }
     conn.req_len = remaining;
+}
+
+#[allow(dead_code)]
+fn _unused_cqe_more() -> u32 {
+    CQE_F_MORE
 }
