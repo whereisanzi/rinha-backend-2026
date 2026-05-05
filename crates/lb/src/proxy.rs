@@ -97,11 +97,11 @@ pub fn run() -> std::io::Result<()> {
         ));
     }
 
+    let listen_fd = create_listener(port, backlog)?;
+
     for u in upstreams.iter_mut() {
         u.ctrl_fd = connect_ctrl(u)?;
     }
-
-    let listen_fd = create_listener(port, backlog)?;
 
     let mut ring: IoUring = IoUring::builder()
         .setup_single_issuer()
