@@ -4,15 +4,19 @@
 .claude/
 *.log
 
-# Reference dataset (large, fetched at build/startup)
+resources/
 references.json.gz
 *.bin
 *.idx
 
-# Build artifacts
 target/
 dist/
 build/
 node_modules/
 __pycache__/
 *.pyc
+
+Cargo.lock.bak
+
+docker-compose.pin.yml
+test/
