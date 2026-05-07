@@ -7,8 +7,10 @@ use std::slice;
 use crate::DIM;
 
 pub const MAGIC: &[u8; 4] = b"RIVF";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_SIZE: usize = 32;
+pub const BLOCK_SIZE: usize = 8;
+pub const BLOCK_STRIDE: usize = DIM * BLOCK_SIZE;
 
 #[cfg(target_os = "linux")]
 const MAP_POPULATE: libc::c_int = libc::MAP_POPULATE;
@@ -27,7 +29,8 @@ pub struct Dataset {
     pub bbox_min: &'static [i16],
     pub bbox_max: &'static [i16],
     pub offsets: &'static [u32],
-    pub dims: [&'static [i16]; DIM],
+    pub block_offsets: &'static [u32],
+    pub blocks: &'static [i16],
     pub labels: &'static [u8],
     pub orig_ids: &'static [u32],
 }
@@ -93,11 +96,13 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
     let offsets = unsafe { slice_typed::<u32>(bytes, off, k + 1) };
     off += offsets_bytes;
 
-    let mut dims: [&'static [i16]; DIM] = [&[]; DIM];
-    for j in 0..DIM {
-        dims[j] = unsafe { slice_typed::<i16>(bytes, off, n) };
-        off += n * 2;
-    }
+    let block_offsets = unsafe { slice_typed::<u32>(bytes, off, k + 1) };
+    off += offsets_bytes;
+    let total_blocks = block_offsets[k] as usize;
+
+    let blocks_count = total_blocks * BLOCK_STRIDE;
+    let blocks = unsafe { slice_typed::<i16>(bytes, off, blocks_count) };
+    off += blocks_count * 2;
 
     let labels = &bytes[off..off + n];
     off += n;
@@ -136,7 +141,8 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
         bbox_min,
         bbox_max,
         offsets,
-        dims,
+        block_offsets,
+        blocks,
         labels,
         orig_ids,
     }));

@@ -5,8 +5,11 @@ use std::path::Path;
 use crate::DIM;
 
 pub const MAGIC: &[u8; 4] = b"RIVF";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const FIX_SCALE: f32 = 10_000.0;
+pub const BLOCK_SIZE: usize = 8;
+pub const BLOCK_STRIDE: usize = DIM * BLOCK_SIZE;
+const PAD_VALUE: i16 = i16::MAX;
 
 #[inline(always)]
 fn quantize(x: f32) -> i16 {
@@ -25,7 +28,8 @@ pub struct Layout {
     pub bbox_min: Vec<i16>,
     pub bbox_max: Vec<i16>,
     pub offsets: Vec<u32>,
-    pub dims_soa: Vec<i16>,
+    pub block_offsets: Vec<u32>,
+    pub blocks: Vec<i16>,
     pub labels: Vec<u8>,
     pub orig_ids: Vec<u32>,
 }
@@ -51,14 +55,21 @@ pub fn build_layout(
     }
     debug_assert_eq!(offsets[k] as usize, n);
 
-    let mut write_pos = offsets[..k].to_vec();
+    let mut block_offsets = vec![0u32; k + 1];
+    for c in 0..k {
+        let blocks_c = (counts[c] as usize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        block_offsets[c + 1] = block_offsets[c] + blocks_c as u32;
+    }
+    let total_blocks = block_offsets[k] as usize;
 
-    let mut dims_soa = vec![0i16; DIM * n];
+    let mut blocks = vec![PAD_VALUE; total_blocks * BLOCK_STRIDE];
     let mut labels = vec![0u8; n];
     let mut orig_ids = vec![0u32; n];
 
     let mut bbox_min = vec![i16::MAX; k * DIM];
     let mut bbox_max = vec![i16::MIN; k * DIM];
+
+    let mut write_pos = offsets[..k].to_vec();
 
     for (i, v) in vectors.iter().enumerate() {
         let c = assignments[i] as usize;
@@ -67,9 +78,15 @@ pub fn build_layout(
         labels[pos] = labels_in[i];
         orig_ids[pos] = i as u32;
 
+        let pos_in_cluster = pos - offsets[c] as usize;
+        let block_local = pos_in_cluster / BLOCK_SIZE;
+        let lane = pos_in_cluster % BLOCK_SIZE;
+        let block_global = block_offsets[c] as usize + block_local;
+        let block_base = block_global * BLOCK_STRIDE;
+
         for j in 0..DIM {
             let q = quantize(v[j]);
-            dims_soa[j * n + pos] = q;
+            blocks[block_base + j * BLOCK_SIZE + lane] = q;
             let bi = c * DIM + j;
             if q < bbox_min[bi] {
                 bbox_min[bi] = q;
@@ -103,7 +120,8 @@ pub fn build_layout(
         bbox_min,
         bbox_max,
         offsets,
-        dims_soa,
+        block_offsets,
+        blocks,
         labels,
         orig_ids,
     }
@@ -127,7 +145,10 @@ pub fn write_index(path: &Path, l: &Layout) -> std::io::Result<()> {
     for o in &l.offsets {
         w.write_all(&o.to_le_bytes())?;
     }
-    write_i16s(&mut w, &l.dims_soa)?;
+    for o in &l.block_offsets {
+        w.write_all(&o.to_le_bytes())?;
+    }
+    write_i16s(&mut w, &l.blocks)?;
     w.write_all(&l.labels)?;
     for id in &l.orig_ids {
         w.write_all(&id.to_le_bytes())?;

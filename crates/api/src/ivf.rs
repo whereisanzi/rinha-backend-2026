@@ -1,5 +1,5 @@
 use crate::DIM;
-use crate::dataset::Dataset;
+use crate::dataset::{BLOCK_SIZE, BLOCK_STRIDE, Dataset};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -203,47 +203,77 @@ fn scan_cluster(
     if start >= end {
         return;
     }
+    let block_start = ds.block_offsets[c] as usize;
+    let block_end = ds.block_offsets[c + 1] as usize;
+    let cluster_size = end - start;
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
             unsafe {
-                scan_cluster_avx2(start, end, q, ds, top5, worst_idx);
+                scan_cluster_avx2(
+                    block_start,
+                    block_end,
+                    start,
+                    cluster_size,
+                    q,
+                    ds,
+                    top5,
+                    worst_idx,
+                );
             }
             return;
         }
     }
-    scan_cluster_scalar(start, end, q, ds, top5, worst_idx);
+    scan_cluster_scalar(
+        block_start,
+        block_end,
+        start,
+        cluster_size,
+        q,
+        ds,
+        top5,
+        worst_idx,
+    );
 }
 
 fn scan_cluster_scalar(
-    start: usize,
-    end: usize,
+    block_start: usize,
+    block_end: usize,
+    vec_start: usize,
+    cluster_size: usize,
     q: &[i16; DIM],
     ds: &Dataset,
     top5: &mut [Top5; 5],
     worst_idx: &mut usize,
 ) {
-    for i in start..end {
-        let mut d: i64 = 0;
-        for j in 0..DIM {
-            let qv = q[j] as i32;
-            let v = ds.dims[j][i] as i32;
-            let diff = qv - v;
-            d += (diff as i64) * (diff as i64);
-            if d > top5[*worst_idx].dist {
-                break;
+    for (block_local, block_idx) in (block_start..block_end).enumerate() {
+        let block_base = block_idx * BLOCK_STRIDE;
+        let lanes_in_block = (cluster_size - block_local * BLOCK_SIZE).min(BLOCK_SIZE);
+        for lane in 0..lanes_in_block {
+            let mut d: i64 = 0;
+            for j in 0..DIM {
+                let qv = q[j] as i32;
+                let v = ds.blocks[block_base + j * BLOCK_SIZE + lane] as i32;
+                let diff = qv - v;
+                d += (diff as i64) * (diff as i64);
+                if d > top5[*worst_idx].dist {
+                    break;
+                }
             }
+            let global = vec_start + block_local * BLOCK_SIZE + lane;
+            try_insert_top5(top5, worst_idx, d, ds.labels[global], ds.orig_ids[global]);
         }
-        try_insert_top5(top5, worst_idx, d, ds.labels[i], ds.orig_ids[i]);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scan_cluster_avx2(
-    start: usize,
-    end: usize,
+    block_start: usize,
+    block_end: usize,
+    vec_start: usize,
+    cluster_size: usize,
     q: &[i16; DIM],
     ds: &Dataset,
     top5: &mut [Top5; 5],
@@ -254,24 +284,26 @@ unsafe fn scan_cluster_avx2(
         q_i32[j] = _mm256_set1_epi32(q[j] as i32);
     }
 
-    let mut i = start;
+    let blocks_ptr = ds.blocks.as_ptr();
     let mut dists = [0i64; 8];
-    while i + 8 <= end {
-        let prefetch_off = i + 16;
-        if prefetch_off + 8 <= end {
-            for j in 0..DIM {
-                _mm_prefetch(
-                    ds.dims[j].as_ptr().add(prefetch_off) as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
+    let num_blocks = block_end - block_start;
+
+    for block_local in 0..num_blocks {
+        let block_idx = block_start + block_local;
+        let block_ptr = blocks_ptr.add(block_idx * BLOCK_STRIDE);
+
+        if block_local + 1 < num_blocks {
+            let next = blocks_ptr.add((block_idx + 1) * BLOCK_STRIDE);
+            _mm_prefetch(next as *const i8, _MM_HINT_T0);
+            _mm_prefetch(next.add(64) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(next.add(112) as *const i8, _MM_HINT_T0);
         }
 
         let mut acc_lo = _mm256_setzero_si256();
         let mut acc_hi = _mm256_setzero_si256();
 
         for j in 0..EARLY_TERM_DIM {
-            let raw = _mm_loadu_si128(ds.dims[j].as_ptr().add(i) as *const __m128i);
+            let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
             let v = _mm256_cvtepi16_epi32(raw);
             let diff = _mm256_sub_epi32(v, q_i32[j]);
             let sq = _mm256_mullo_epi32(diff, diff);
@@ -283,21 +315,23 @@ unsafe fn scan_cluster_avx2(
 
         _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
         _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
+
+        let lanes_in_block = (cluster_size - block_local * BLOCK_SIZE).min(BLOCK_SIZE);
+
         let worst = top5[*worst_idx].dist;
         let mut any_below = false;
-        for d in dists.iter() {
-            if *d < worst {
+        for &d in dists.iter().take(lanes_in_block) {
+            if d < worst {
                 any_below = true;
                 break;
             }
         }
         if !any_below {
-            i += 8;
             continue;
         }
 
         for j in EARLY_TERM_DIM..DIM {
-            let raw = _mm_loadu_si128(ds.dims[j].as_ptr().add(i) as *const __m128i);
+            let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
             let v = _mm256_cvtepi16_epi32(raw);
             let diff = _mm256_sub_epi32(v, q_i32[j]);
             let sq = _mm256_mullo_epi32(diff, diff);
@@ -309,8 +343,8 @@ unsafe fn scan_cluster_avx2(
 
         _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
         _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
-        for lane in 0..8 {
-            let global = i + lane;
+        for lane in 0..lanes_in_block {
+            let global = vec_start + block_local * BLOCK_SIZE + lane;
             try_insert_top5(
                 top5,
                 worst_idx,
@@ -319,12 +353,6 @@ unsafe fn scan_cluster_avx2(
                 ds.orig_ids[global],
             );
         }
-
-        i += 8;
-    }
-
-    if i < end {
-        scan_cluster_scalar(i, end, q, ds, top5, worst_idx);
     }
 }
 
@@ -377,16 +405,29 @@ mod tests {
             offsets.push(acc);
         }
 
-        let mut dims_storage: Vec<Vec<i16>> = (0..DIM).map(|_| Vec::with_capacity(n)).collect();
+        let mut block_offsets = Vec::with_capacity(k + 1);
+        block_offsets.push(0u32);
+        let mut bacc = 0u32;
+        for (v, _, _) in clusters {
+            bacc += ((v.len() + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+            block_offsets.push(bacc);
+        }
+        let total_blocks = bacc as usize;
+
+        let mut blocks = vec![i16::MAX; total_blocks * BLOCK_STRIDE];
         let mut labels = Vec::with_capacity(n);
         let mut orig_ids = Vec::with_capacity(n);
         let mut bbox_min = vec![i16::MAX; k * DIM];
         let mut bbox_max = vec![i16::MIN; k * DIM];
 
         for (c, (vecs, lbls, ids)) in clusters.iter().enumerate() {
+            let block_base_global = block_offsets[c] as usize;
             for (idx, v) in vecs.iter().enumerate() {
+                let block_local = idx / BLOCK_SIZE;
+                let lane = idx % BLOCK_SIZE;
+                let block_base = (block_base_global + block_local) * BLOCK_STRIDE;
                 for j in 0..DIM {
-                    dims_storage[j].push(v[j]);
+                    blocks[block_base + j * BLOCK_SIZE + lane] = v[j];
                     let bi = c * DIM + j;
                     if v[j] < bbox_min[bi] {
                         bbox_min[bi] = v[j];
@@ -413,11 +454,6 @@ mod tests {
             }
         }
 
-        let dims: [&'static [i16]; DIM] = std::array::from_fn(|j| {
-            let leaked: &'static [i16] = Vec::leak(std::mem::take(&mut dims_storage[j]));
-            leaked
-        });
-
         let ds = Dataset {
             n,
             k,
@@ -428,7 +464,8 @@ mod tests {
             bbox_min: Vec::leak(bbox_min),
             bbox_max: Vec::leak(bbox_max),
             offsets: Vec::leak(offsets),
-            dims,
+            block_offsets: Vec::leak(block_offsets),
+            blocks: Vec::leak(blocks),
             labels: Vec::leak(labels),
             orig_ids: Vec::leak(orig_ids),
         };
