@@ -18,9 +18,12 @@ const MAP_POPULATE: libc::c_int = 0;
 pub struct Dataset {
     pub n: usize,
     pub k: usize,
+    pub k_pad: usize,
     #[allow(dead_code)]
     pub scale: f32,
+    #[allow(dead_code)]
     pub centroids: &'static [f32],
+    pub centroids_soa: &'static [f32],
     pub bbox_min: &'static [i16],
     pub bbox_max: &'static [i16],
     pub offsets: &'static [u32],
@@ -109,11 +112,27 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
         return Err(io_err("offsets[k] != n"));
     }
 
+    let k_pad = (k + 7) & !7;
+    let mut centroids_soa_vec = vec![0.0f32; DIM * k_pad];
+    for c in 0..k {
+        for j in 0..DIM {
+            centroids_soa_vec[j * k_pad + c] = centroids[c * DIM + j];
+        }
+    }
+    for c in k..k_pad {
+        for j in 0..DIM {
+            centroids_soa_vec[j * k_pad + c] = f32::INFINITY;
+        }
+    }
+    let centroids_soa: &'static [f32] = Vec::leak(centroids_soa_vec);
+
     let ds = Box::leak(Box::new(Dataset {
         n,
         k,
+        k_pad,
         scale,
         centroids,
+        centroids_soa,
         bbox_min,
         bbox_max,
         offsets,

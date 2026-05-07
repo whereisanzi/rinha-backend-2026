@@ -38,9 +38,8 @@ const SENTINEL: Top5 = Top5 {
 pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, _nprobe: usize) -> u8 {
     let mut cdists = [f32::INFINITY; MAX_K];
     let k = ds.k.min(MAX_K);
-    for c in 0..k {
-        cdists[c] = centroid_dist_sq(query, ds, c);
-    }
+    let k_pad = ds.k_pad.min(MAX_K);
+    compute_centroid_dists(query, ds, &mut cdists, k_pad);
 
     let fast_probes = top_n_centroids::<FAST_NPROBE>(&cdists[..k]);
 
@@ -130,15 +129,66 @@ pub fn quantize_i16(x: f32) -> i16 {
     r as i16
 }
 
-#[inline]
-fn centroid_dist_sq(query: &[f32; DIM], ds: &Dataset, c: usize) -> f32 {
-    let base = c * DIM;
-    let mut s = 0.0f32;
-    for j in 0..DIM {
-        let d = query[j] - ds.centroids[base + j];
-        s += d * d;
+fn compute_centroid_dists(query: &[f32; DIM], ds: &Dataset, out: &mut [f32; MAX_K], k_pad: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { compute_centroid_dists_avx2(query, ds, out, k_pad) };
+            return;
+        }
     }
-    s
+    compute_centroid_dists_scalar(query, ds, out, k_pad);
+}
+
+fn compute_centroid_dists_scalar(
+    query: &[f32; DIM],
+    ds: &Dataset,
+    out: &mut [f32; MAX_K],
+    k_pad: usize,
+) {
+    let kp = k_pad;
+    for c in 0..ds.k {
+        let mut s = 0.0f32;
+        for j in 0..DIM {
+            let d = query[j] - ds.centroids_soa[j * kp + c];
+            s += d * d;
+        }
+        out[c] = s;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn compute_centroid_dists_avx2(
+    query: &[f32; DIM],
+    ds: &Dataset,
+    out: &mut [f32; MAX_K],
+    k_pad: usize,
+) {
+    let cp = ds.centroids_soa.as_ptr();
+    let op = out.as_mut_ptr();
+
+    let qd0 = _mm256_set1_ps(query[0]);
+    let mut c = 0usize;
+    while c + 8 <= k_pad {
+        let cv = _mm256_loadu_ps(cp.add(c));
+        let d = _mm256_sub_ps(cv, qd0);
+        _mm256_storeu_ps(op.add(c), _mm256_mul_ps(d, d));
+        c += 8;
+    }
+
+    for j in 1..DIM {
+        let base = j * k_pad;
+        let qd = _mm256_set1_ps(query[j]);
+        let mut c = 0usize;
+        while c + 8 <= k_pad {
+            let cv = _mm256_loadu_ps(cp.add(base + c));
+            let d = _mm256_sub_ps(cv, qd);
+            let prev = _mm256_loadu_ps(op.add(c));
+            _mm256_storeu_ps(op.add(c), _mm256_fmadd_ps(d, d, prev));
+            c += 8;
+        }
+    }
 }
 
 fn scan_cluster(
@@ -207,6 +257,16 @@ unsafe fn scan_cluster_avx2(
     let mut i = start;
     let mut dists = [0i64; 8];
     while i + 8 <= end {
+        let prefetch_off = i + 16;
+        if prefetch_off + 8 <= end {
+            for j in 0..DIM {
+                _mm_prefetch(
+                    ds.dims[j].as_ptr().add(prefetch_off) as *const i8,
+                    _MM_HINT_T0,
+                );
+            }
+        }
+
         let mut acc_lo = _mm256_setzero_si256();
         let mut acc_hi = _mm256_setzero_si256();
 
@@ -345,6 +405,14 @@ mod tests {
             centroids.extend_from_slice(c);
         }
 
+        let k_pad = (k + 7) & !7;
+        let mut centroids_soa = vec![f32::INFINITY; DIM * k_pad];
+        for c in 0..k {
+            for j in 0..DIM {
+                centroids_soa[j * k_pad + c] = centroids[c * DIM + j];
+            }
+        }
+
         let dims: [&'static [i16]; DIM] = std::array::from_fn(|j| {
             let leaked: &'static [i16] = Vec::leak(std::mem::take(&mut dims_storage[j]));
             leaked
@@ -353,8 +421,10 @@ mod tests {
         let ds = Dataset {
             n,
             k,
+            k_pad,
             scale: FIX_SCALE,
             centroids: Vec::leak(centroids),
+            centroids_soa: Vec::leak(centroids_soa),
             bbox_min: Vec::leak(bbox_min),
             bbox_max: Vec::leak(bbox_max),
             offsets: Vec::leak(offsets),
