@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod ctrl;
 mod dataset;
 mod http;
 mod ivf;
