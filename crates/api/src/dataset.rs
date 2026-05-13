@@ -25,7 +25,9 @@ pub struct Dataset {
     pub scale: f32,
     #[allow(dead_code)]
     pub centroids: &'static [f32],
+    #[allow(dead_code)]
     pub centroids_soa: &'static [f32],
+    pub centroids_soa_i16: &'static [i16],
     pub bbox_min: &'static [i16],
     pub bbox_max: &'static [i16],
     pub offsets: &'static [u32],
@@ -131,6 +133,18 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
     }
     let centroids_soa: &'static [f32] = Vec::leak(centroids_soa_vec);
 
+    let mut centroids_soa_i16_vec = vec![i16::MAX; DIM * k_pad];
+    for c in 0..k {
+        for j in 0..DIM {
+            let v = centroids[c * DIM + j];
+            let clamped = v.clamp(-1.0, 1.0);
+            let s = clamped * scale;
+            let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
+            centroids_soa_i16_vec[j * k_pad + c] = r as i16;
+        }
+    }
+    let centroids_soa_i16: &'static [i16] = Vec::leak(centroids_soa_i16_vec);
+
     let ds = Box::leak(Box::new(Dataset {
         n,
         k,
@@ -138,6 +152,7 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
         scale,
         centroids,
         centroids_soa,
+        centroids_soa_i16,
         bbox_min,
         bbox_max,
         offsets,

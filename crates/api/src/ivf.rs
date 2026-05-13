@@ -9,6 +9,8 @@ pub const FIX_SCALE: f32 = 10_000.0;
 const MAX_K: usize = 4096;
 const BITSET_WORDS: usize = (MAX_K + 63) / 64;
 const FAST_NPROBE: usize = 8;
+const REPAIR_MIN: u8 = 2;
+const REPAIR_MAX: u8 = 3;
 #[cfg(target_arch = "x86_64")]
 const EARLY_TERM_DIM: usize = 8;
 
@@ -36,21 +38,21 @@ const SENTINEL: Top5 = Top5 {
 };
 
 pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, _nprobe: usize) -> u8 {
-    let mut cdists = [f32::INFINITY; MAX_K];
+    let mut q_i16 = [0i16; DIM];
+    for j in 0..DIM {
+        q_i16[j] = quantize_i16(query[j]);
+    }
+
+    let mut cdists = [u32::MAX; MAX_K];
     let k = ds.k.min(MAX_K);
     let k_pad = ds.k_pad.min(MAX_K);
-    compute_centroid_dists(query, ds, &mut cdists, k_pad);
+    compute_centroid_dists_i16(&q_i16, ds, &mut cdists, k_pad);
 
     let fast_probes = top_n_centroids::<FAST_NPROBE>(&cdists[..k]);
 
     let mut top5 = [SENTINEL; 5];
     let mut worst_idx = 0usize;
     let mut scanned = [0u64; BITSET_WORDS];
-
-    let mut q_i16 = [0i16; DIM];
-    for j in 0..DIM {
-        q_i16[j] = quantize_i16(query[j]);
-    }
 
     for &c in fast_probes.iter() {
         if !bitset_get(&scanned, c) {
@@ -60,7 +62,7 @@ pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, _nprobe: usize) -> u
     }
 
     let fast_count: u8 = top5.iter().map(|e| e.label as u8).sum();
-    if fast_count != 2 && fast_count != 3 {
+    if fast_count < REPAIR_MIN || fast_count > REPAIR_MAX {
         return fast_count.min(5);
     }
 
@@ -98,8 +100,8 @@ fn bbox_lower_bound(q: &[i16; DIM], ds: &Dataset, c: usize) -> i64 {
     s
 }
 
-fn top_n_centroids<const N: usize>(dists: &[f32]) -> [usize; N] {
-    let mut top_d = [f32::INFINITY; N];
+fn top_n_centroids<const N: usize>(dists: &[u32]) -> [usize; N] {
+    let mut top_d = [u32::MAX; N];
     let mut top_i = [0usize; N];
     for (c, &d) in dists.iter().enumerate() {
         if d < top_d[N - 1] {
@@ -129,65 +131,80 @@ pub fn quantize_i16(x: f32) -> i16 {
     r as i16
 }
 
-fn compute_centroid_dists(query: &[f32; DIM], ds: &Dataset, out: &mut [f32; MAX_K], k_pad: usize) {
+fn compute_centroid_dists_i16(
+    query: &[i16; DIM],
+    ds: &Dataset,
+    out: &mut [u32; MAX_K],
+    k_pad: usize,
+) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { compute_centroid_dists_avx2(query, ds, out, k_pad) };
+        if is_x86_feature_detected!("avx2") {
+            unsafe { compute_centroid_dists_i16_avx2(query, ds, out, k_pad) };
             return;
         }
     }
-    compute_centroid_dists_scalar(query, ds, out, k_pad);
+    compute_centroid_dists_i16_scalar(query, ds, out, k_pad);
 }
 
-fn compute_centroid_dists_scalar(
-    query: &[f32; DIM],
+fn compute_centroid_dists_i16_scalar(
+    query: &[i16; DIM],
     ds: &Dataset,
-    out: &mut [f32; MAX_K],
+    out: &mut [u32; MAX_K],
     k_pad: usize,
 ) {
     let kp = k_pad;
     for c in 0..ds.k {
-        let mut s = 0.0f32;
+        let mut s: u32 = 0;
         for j in 0..DIM {
-            let d = query[j] - ds.centroids_soa[j * kp + c];
-            s += d * d;
+            let q = query[j] as i32;
+            let v = ds.centroids_soa_i16[j * kp + c] as i32;
+            let d = q - v;
+            s = s.wrapping_add((d * d) as u32);
         }
         out[c] = s;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn compute_centroid_dists_avx2(
-    query: &[f32; DIM],
+#[target_feature(enable = "avx2")]
+unsafe fn compute_centroid_dists_i16_avx2(
+    query: &[i16; DIM],
     ds: &Dataset,
-    out: &mut [f32; MAX_K],
+    out: &mut [u32; MAX_K],
     k_pad: usize,
 ) {
-    let cp = ds.centroids_soa.as_ptr();
-    let op = out.as_mut_ptr();
+    let cp = ds.centroids_soa_i16.as_ptr();
+    let op = out.as_mut_ptr() as *mut __m256i;
 
-    let qd0 = _mm256_set1_ps(query[0]);
     let mut c = 0usize;
     while c + 8 <= k_pad {
-        let cv = _mm256_loadu_ps(cp.add(c));
-        let d = _mm256_sub_ps(cv, qd0);
-        _mm256_storeu_ps(op.add(c), _mm256_mul_ps(d, d));
-        c += 8;
-    }
-
-    for j in 1..DIM {
-        let base = j * k_pad;
-        let qd = _mm256_set1_ps(query[j]);
-        let mut c = 0usize;
-        while c + 8 <= k_pad {
-            let cv = _mm256_loadu_ps(cp.add(base + c));
-            let d = _mm256_sub_ps(cv, qd);
-            let prev = _mm256_loadu_ps(op.add(c));
-            _mm256_storeu_ps(op.add(c), _mm256_fmadd_ps(d, d, prev));
-            c += 8;
+        let mut acc = _mm256_setzero_si256();
+        let mut j = 0usize;
+        while j + 2 <= DIM {
+            let r0 = _mm_loadu_si128(cp.add(j * k_pad + c) as *const __m128i);
+            let r1 = _mm_loadu_si128(cp.add((j + 1) * k_pad + c) as *const __m128i);
+            let q0 = _mm_set1_epi16(query[j]);
+            let q1 = _mm_set1_epi16(query[j + 1]);
+            let d0 = _mm_sub_epi16(q0, r0);
+            let d1 = _mm_sub_epi16(q1, r1);
+            let lo = _mm_unpacklo_epi16(d0, d1);
+            let hi = _mm_unpackhi_epi16(d0, d1);
+            let pairs = _mm256_set_m128i(hi, lo);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, pairs));
+            j += 2;
         }
+        while j < DIM {
+            let r = _mm_loadu_si128(cp.add(j * k_pad + c) as *const __m128i);
+            let q = _mm_set1_epi16(query[j]);
+            let d = _mm_sub_epi16(q, r);
+            let d_lo = _mm256_cvtepi16_epi32(d);
+            let sq = _mm256_mullo_epi32(d_lo, d_lo);
+            acc = _mm256_add_epi32(acc, sq);
+            j += 1;
+        }
+        _mm256_storeu_si256(op.add(c / 8), acc);
+        c += 8;
     }
 }
 
@@ -448,9 +465,15 @@ mod tests {
 
         let k_pad = (k + 7) & !7;
         let mut centroids_soa = vec![f32::INFINITY; DIM * k_pad];
+        let mut centroids_soa_i16 = vec![i16::MAX; DIM * k_pad];
         for c in 0..k {
             for j in 0..DIM {
-                centroids_soa[j * k_pad + c] = centroids[c * DIM + j];
+                let v = centroids[c * DIM + j];
+                centroids_soa[j * k_pad + c] = v;
+                let clamped = v.clamp(-1.0, 1.0);
+                let s = clamped * FIX_SCALE;
+                let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
+                centroids_soa_i16[j * k_pad + c] = r as i16;
             }
         }
 
@@ -461,6 +484,7 @@ mod tests {
             scale: FIX_SCALE,
             centroids: Vec::leak(centroids),
             centroids_soa: Vec::leak(centroids_soa),
+            centroids_soa_i16: Vec::leak(centroids_soa_i16),
             bbox_min: Vec::leak(bbox_min),
             bbox_max: Vec::leak(bbox_max),
             offsets: Vec::leak(offsets),
