@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/whereisanzi/rinha-lb:7a94b76
+    image: ghcr.io/whereisanzi/rinha-lb:bc75dd0
     ports:
       - "9999:9999"
     environment:
@@ -24,11 +24,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "60M"
+          cpus: "0.16"
+          memory: "30M"
 
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:7a94b76
+    image: ghcr.io/whereisanzi/rinha-api:bc75dd0
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
@@ -49,11 +49,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "145M"
+          cpus: "0.42"
+          memory: "160M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:7a94b76
+    image: ghcr.io/whereisanzi/rinha-api:bc75dd0
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
@@ -74,8 +74,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "145M"
+          cpus: "0.42"
+          memory: "160M"
     depends_on:
       - api1
 
