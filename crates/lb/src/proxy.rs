@@ -7,68 +7,23 @@ use io_uring::{IoUring, opcode, types};
 
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_BACKLOG: i32 = 4096;
-const MAX_HANDOFFS: usize = 4096;
 const RING_QD: u32 = 4096;
 const CONNECT_RETRY_MS: u64 = 50;
 
 const CQE_F_MORE: u32 = 1 << 1;
 
 const OP_ACCEPT: u8 = 1;
-const OP_SENDMSG: u8 = 2;
 
-const GEN_MASK: u64 = 0x00ff_ffff;
-const GEN_SHIFT: u32 = 32;
-const SLOT_MASK: u64 = 0xffff_ffff;
 const OP_SHIFT: u32 = 56;
 
 #[inline(always)]
-fn pack(op: u8, generation: u32, slot: u32) -> u64 {
-    ((op as u64) << OP_SHIFT)
-        | (((generation as u64) & GEN_MASK) << GEN_SHIFT)
-        | ((slot as u64) & SLOT_MASK)
+fn pack(op: u8) -> u64 {
+    (op as u64) << OP_SHIFT
 }
 
 #[inline(always)]
 fn unpack_op(u: u64) -> u8 {
     (u >> OP_SHIFT) as u8
-}
-
-#[inline(always)]
-fn unpack_gen(u: u64) -> u32 {
-    ((u >> GEN_SHIFT) & GEN_MASK) as u32
-}
-
-#[inline(always)]
-fn unpack_slot(u: u64) -> u32 {
-    (u & SLOT_MASK) as u32
-}
-
-#[repr(C)]
-struct Handoff {
-    in_use: bool,
-    generation: u32,
-    client_fd: RawFd,
-    payload: u8,
-    iov: libc::iovec,
-    msg: libc::msghdr,
-    cmsg_buf: [u8; 32],
-}
-
-impl Handoff {
-    fn new() -> Self {
-        Self {
-            in_use: false,
-            generation: 0,
-            client_fd: -1,
-            payload: 0,
-            iov: libc::iovec {
-                iov_base: ptr::null_mut(),
-                iov_len: 0,
-            },
-            msg: unsafe { mem::zeroed() },
-            cmsg_buf: [0u8; 32],
-        }
-    }
 }
 
 struct Upstream {
@@ -109,12 +64,10 @@ pub fn run() -> std::io::Result<()> {
     let mut ring: IoUring = IoUring::builder()
         .setup_single_issuer()
         .setup_coop_taskrun()
-        .setup_defer_taskrun()
-        .setup_taskrun_flag()
         .build(RING_QD)?;
 
     eprintln!(
-        "lb listen=:{} backlog={} upstreams=[{}] (io_uring qd={}, scm_rights handoff)",
+        "lb listen=:{} backlog={} upstreams=[{}] (io_uring qd={}, sync sendmsg handoff)",
         port,
         backlog,
         upstreams
@@ -125,9 +78,6 @@ pub fn run() -> std::io::Result<()> {
         RING_QD,
     );
 
-    let mut handoffs: Vec<Box<Handoff>> =
-        (0..MAX_HANDOFFS).map(|_| Box::new(Handoff::new())).collect();
-    let mut free_slots: Vec<u32> = (0..MAX_HANDOFFS as u32).rev().collect();
     let mut rr: usize = 0;
 
     push_accept(&mut ring, listen_fd);
@@ -145,23 +95,7 @@ pub fn run() -> std::io::Result<()> {
             let flags = cqe.flags();
             match unpack_op(ud) {
                 OP_ACCEPT => {
-                    handle_accept(
-                        &mut ring,
-                        listen_fd,
-                        res,
-                        flags,
-                        &mut handoffs,
-                        &mut free_slots,
-                        &upstreams,
-                        &mut rr,
-                    );
-                }
-                OP_SENDMSG => {
-                    let slot = unpack_slot(ud) as usize;
-                    let gen_id = unpack_gen(ud);
-                    if handoffs[slot].in_use && handoffs[slot].generation == gen_id {
-                        handle_sendmsg(slot, res, &mut handoffs, &mut free_slots);
-                    }
+                    handle_accept(&mut ring, listen_fd, res, flags, &upstreams, &mut rr);
                 }
                 _ => {}
             }
@@ -174,8 +108,6 @@ fn handle_accept(
     listen_fd: RawFd,
     res: i32,
     flags: u32,
-    handoffs: &mut [Box<Handoff>],
-    free_slots: &mut Vec<u32>,
     upstreams: &[Upstream],
     rr: &mut usize,
 ) {
@@ -189,91 +121,45 @@ fn handle_accept(
 
     set_tcp_nodelay(client_fd);
 
-    let slot = match free_slots.pop() {
-        Some(s) => s as usize,
-        None => {
-            unsafe {
-                libc::close(client_fd);
-            }
-            return;
-        }
-    };
-
     let idx = *rr % upstreams.len();
     *rr = rr.wrapping_add(1);
 
-    let h = &mut handoffs[slot];
-    h.in_use = true;
-    h.generation = h.generation.wrapping_add(1) & (GEN_MASK as u32);
-    h.client_fd = client_fd;
-    setup_handoff_msg(h);
-
-    push_sendmsg(
-        ring,
-        slot,
-        h.generation,
-        upstreams[idx].ctrl_fd,
-        &mut h.msg as *mut _,
-    );
-}
-
-fn handle_sendmsg(
-    slot: usize,
-    _res: i32,
-    handoffs: &mut [Box<Handoff>],
-    free_slots: &mut Vec<u32>,
-) {
-    let h = &mut handoffs[slot];
-    if h.client_fd >= 0 {
-        unsafe {
-            libc::close(h.client_fd);
-        }
-        h.client_fd = -1;
-    }
-    h.in_use = false;
-    free_slots.push(slot as u32);
-}
-
-fn setup_handoff_msg(h: &mut Handoff) {
-    h.payload = 0;
-    h.iov.iov_base = &mut h.payload as *mut _ as *mut libc::c_void;
-    h.iov.iov_len = 1;
-
-    h.msg.msg_name = ptr::null_mut();
-    h.msg.msg_namelen = 0;
-    h.msg.msg_iov = &mut h.iov as *mut _;
-    h.msg.msg_iovlen = 1;
-    h.msg.msg_control = h.cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    h.msg.msg_controllen = unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as u32) } as _;
-    h.msg.msg_flags = 0;
-
     unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&h.msg as *const _);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
-        let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
-        ptr::write_unaligned(data, h.client_fd);
+        send_fd_to(upstreams[idx].ctrl_fd, client_fd);
+        libc::close(client_fd);
     }
+}
+
+unsafe fn send_fd_to(ctrl: RawFd, fd: RawFd) {
+    let cmsg_space = libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as u32) as usize;
+    let mut cmsg_buf: [u8; 32] = [0u8; 32];
+
+    let mut dummy: u8 = 0;
+    let mut iov = libc::iovec {
+        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+        iov_len: 1,
+    };
+
+    let mut msg: libc::msghdr = mem::zeroed();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space as _;
+
+    let cmsg = libc::CMSG_FIRSTHDR(&msg);
+    (*cmsg).cmsg_level = libc::SOL_SOCKET;
+    (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+    (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as u32) as _;
+    let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
+    ptr::write_unaligned(data, fd);
+
+    libc::sendmsg(ctrl, &msg, 0);
 }
 
 fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {
     let sqe = opcode::AcceptMulti::new(types::Fd(listen_fd))
         .build()
-        .user_data(pack(OP_ACCEPT, 0, 0));
-    push_sqe(ring, sqe);
-}
-
-fn push_sendmsg(
-    ring: &mut IoUring,
-    slot: usize,
-    gen_id: u32,
-    ctrl_fd: RawFd,
-    msg: *mut libc::msghdr,
-) {
-    let sqe = opcode::SendMsg::new(types::Fd(ctrl_fd), msg)
-        .build()
-        .user_data(pack(OP_SENDMSG, gen_id, slot as u32));
+        .user_data(pack(OP_ACCEPT));
     push_sqe(ring, sqe);
 }
 
