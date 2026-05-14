@@ -85,9 +85,8 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    prewarm(ds, cfg.nprobe);
-
     let ctrl_path = format!("{}.ctrl", cfg.uds_path);
+    let t0 = std::time::Instant::now();
     let listener = ctrl::bind_ctrl_listener(&ctrl_path, cfg.uds_mode)?;
     let eventfd = ctrl::create_eventfd()?;
     let queue: Arc<Mutex<Vec<RawFd>>> = Arc::new(Mutex::new(Vec::with_capacity(256)));
@@ -96,6 +95,11 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
         eventfd,
     };
     ctrl::spawn_ctrl_thread(listener, channel);
+    eprintln!("api ctrl bind+spawn: {:?} (path={})", t0.elapsed(), ctrl_path);
+
+    let t1 = std::time::Instant::now();
+    prewarm(ds, cfg.nprobe);
+    eprintln!("api prewarm: {:?}", t1.elapsed());
 
     eprintln!(
         "api listening on ctrl={} (qd={}, nprobe={}, scm_rights handoff)",

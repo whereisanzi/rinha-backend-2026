@@ -12,9 +12,6 @@ pub const HEADER_SIZE: usize = 32;
 pub const BLOCK_SIZE: usize = 8;
 pub const BLOCK_STRIDE: usize = DIM * BLOCK_SIZE;
 
-#[cfg(target_os = "linux")]
-const MAP_POPULATE: libc::c_int = libc::MAP_POPULATE;
-#[cfg(not(target_os = "linux"))]
 const MAP_POPULATE: libc::c_int = 0;
 
 pub struct Dataset {

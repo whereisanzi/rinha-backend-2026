@@ -96,11 +96,15 @@ pub fn run() -> std::io::Result<()> {
         ));
     }
 
+    let t0 = std::time::Instant::now();
+    let listen_fd = create_listener(port, backlog)?;
+    eprintln!("lb tcp bind: {:?}", t0.elapsed());
+
+    let t1 = std::time::Instant::now();
     for u in upstreams.iter_mut() {
         u.ctrl_fd = connect_ctrl_retry(u);
     }
-
-    let listen_fd = create_listener(port, backlog)?;
+    eprintln!("lb ctrl connect: {:?}", t1.elapsed());
 
     let mut ring: IoUring = IoUring::builder()
         .setup_single_issuer()
