@@ -47,7 +47,7 @@ services:
       resources:
         limits:
           cpus: "0.10"
-          memory: "20M"
+          memory: "30M"
 
   api1:
     image: rinha-api:latest
@@ -78,7 +78,7 @@ services:
       resources:
         limits:
           cpus: "0.37"
-          memory: "150M"
+          memory: "145M"
 
   api2:
     image: rinha-api:latest
@@ -106,7 +106,7 @@ services:
       resources:
         limits:
           cpus: "0.37"
-          memory: "150M"
+          memory: "145M"
 
 volumes:
   sockets:
