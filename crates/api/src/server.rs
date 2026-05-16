@@ -128,9 +128,15 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> std::io::Result<()> {
     let listener = ctrl::bind_ctrl_listener(&ctrl_path, cfg.uds_mode)?;
     eprintln!("api ctrl bind: {:?} (path={})", t0.elapsed(), ctrl_path);
 
-    let t1 = std::time::Instant::now();
-    prewarm(ds, cfg.nprobe);
-    eprintln!("api prewarm: {:?}", t1.elapsed());
+    let nprobe = cfg.nprobe;
+    std::thread::Builder::new()
+        .name("prewarm".into())
+        .spawn(move || {
+            let t = std::time::Instant::now();
+            prewarm(ds, nprobe);
+            eprintln!("api prewarm (bg): {:?}", t.elapsed());
+        })
+        .expect("spawn prewarm");
 
     let t2 = std::time::Instant::now();
     let (ctrl_conn, _addr) = listener.accept()?;
