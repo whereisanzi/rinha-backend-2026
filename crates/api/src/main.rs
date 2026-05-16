@@ -47,6 +47,7 @@ fn main() -> std::io::Result<()> {
             uds_mode: env_usize("UDS_MODE", 0o666) as u32,
             nprobe: env_usize("NPROBE", ivf::nprobe_default()),
             backlog: env_i32("BACKLOG", 4096),
+            cpu_pin: std::env::var("RINHA_CPU").ok().and_then(|s| s.parse().ok()),
         };
         return server::run(cfg, ds);
     }

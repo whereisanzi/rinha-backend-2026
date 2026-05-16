@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/api",
     "crates/build-index",
-    "crates/init-copy",
 ]
 
 [workspace.package]

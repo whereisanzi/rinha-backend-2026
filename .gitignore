@@ -20,3 +20,11 @@ Cargo.lock.bak
 
 docker-compose.pin.yml
 test/
+
+# bench/ — only test.js + smoke.js + run.sh are versioned;
+# test-data.json (~26 MB) and results.json are fetched/generated at runtime
+!bench/test/
+!bench/test/test.js
+!bench/test/smoke.js
+bench/test/test-data.json
+bench/test/results.json

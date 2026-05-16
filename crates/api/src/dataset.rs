@@ -12,7 +12,15 @@ pub const HEADER_SIZE: usize = 32;
 pub const BLOCK_SIZE: usize = 8;
 pub const BLOCK_STRIDE: usize = DIM * BLOCK_SIZE;
 
+#[cfg(target_os = "linux")]
+const MAP_POPULATE: libc::c_int = 0x8000;
+#[cfg(not(target_os = "linux"))]
 const MAP_POPULATE: libc::c_int = 0;
+
+#[cfg(target_os = "linux")]
+const MADV_HUGEPAGE: libc::c_int = 14;
+#[cfg(target_os = "linux")]
+const MADV_WILLNEED: libc::c_int = 3;
 
 pub struct Dataset {
     pub n: usize,
@@ -55,6 +63,13 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
         return Err(std::io::Error::last_os_error());
     }
 
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::madvise(ptr, len, MADV_WILLNEED);
+        libc::madvise(ptr, len, MADV_HUGEPAGE);
+        let _ = libc::mlock(ptr, len);
+    }
+    #[cfg(not(target_os = "linux"))]
     unsafe {
         libc::madvise(ptr, len, libc::MADV_RANDOM);
     }

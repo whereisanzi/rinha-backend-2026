@@ -31,24 +31,6 @@ services:
           cpus: "0.16"
           memory: "30M"
 
-  init:
-    image: rinha-index:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.index
-    volumes:
-      - resources:/resources
-    networks:
-      - rinha-net
-    security_opt:
-      - seccomp=unconfined
-    restart: "no"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.10"
-          memory: "30M"
-
   api1:
     image: rinha-api:latest
     build:
@@ -60,25 +42,29 @@ services:
       - UDS_MODE=438
       - NPROBE=1
       - BACKLOG=4096
+      - RINHA_CPU=0
     volumes:
       - sockets:/sockets
-      - resources:/resources:ro
-    depends_on:
-      init:
-        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
       - seccomp=unconfined
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio: 99
     deploy:
       resources:
         limits:
-          cpus: "0.37"
-          memory: "145M"
+          cpus: "0.42"
+          memory: "160M"
 
   api2:
     image: rinha-api:latest
@@ -88,29 +74,34 @@ services:
       - UDS_MODE=438
       - NPROBE=1
       - BACKLOG=4096
+      - RINHA_CPU=2
     volumes:
       - sockets:/sockets
-      - resources:/resources:ro
-    depends_on:
-      init:
-        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
       - seccomp=unconfined
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio: 99
     deploy:
       resources:
         limits:
-          cpus: "0.37"
-          memory: "145M"
+          cpus: "0.42"
+          memory: "160M"
+    depends_on:
+      - api1
 
 volumes:
   sockets:
-  resources:
 
 networks:
   rinha-net:

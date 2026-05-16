@@ -10,3 +10,4 @@ target/
 
 # Big input file is not needed inside the build context — index.bin is the artifact
 resources/references.json.gz
+bench/
