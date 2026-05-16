@@ -12,7 +12,9 @@ const FAST_NPROBE: usize = 8;
 const REPAIR_MIN: u8 = 2;
 const REPAIR_MAX: u8 = 3;
 #[cfg(target_arch = "x86_64")]
-const EARLY_TERM_DIM: usize = 8;
+const PHASE1_END: usize = 5;
+#[cfg(target_arch = "x86_64")]
+const PHASE2_END: usize = 10;
 
 #[inline(always)]
 fn bitset_set(bs: &mut [u64; BITSET_WORDS], i: usize) {
@@ -319,44 +321,27 @@ unsafe fn scan_cluster_avx2(
         let mut acc_lo = _mm256_setzero_si256();
         let mut acc_hi = _mm256_setzero_si256();
 
-        for j in 0..EARLY_TERM_DIM {
-            let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
-            let v = _mm256_cvtepi16_epi32(raw);
-            let diff = _mm256_sub_epi32(v, q_i32[j]);
-            let sq = _mm256_mullo_epi32(diff, diff);
-            let lo = _mm256_castsi256_si128(sq);
-            let hi = _mm256_extracti128_si256(sq, 1);
-            acc_lo = _mm256_add_epi64(acc_lo, _mm256_cvtepi32_epi64(lo));
-            acc_hi = _mm256_add_epi64(acc_hi, _mm256_cvtepi32_epi64(hi));
-        }
-
-        _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
-        _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
-
         let lanes_in_block = (cluster_size - block_local * BLOCK_SIZE).min(BLOCK_SIZE);
-
         let worst = top5[*worst_idx].dist;
-        let mut any_below = false;
-        for &d in dists.iter().take(lanes_in_block) {
-            if d < worst {
-                any_below = true;
-                break;
-            }
-        }
-        if !any_below {
+
+        accumulate_dims_avx2(block_ptr, &q_i32, 0, PHASE1_END, &mut acc_lo, &mut acc_hi);
+        if !any_below_avx2(acc_lo, acc_hi, &mut dists, lanes_in_block, worst) {
             continue;
         }
 
-        for j in EARLY_TERM_DIM..DIM {
-            let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
-            let v = _mm256_cvtepi16_epi32(raw);
-            let diff = _mm256_sub_epi32(v, q_i32[j]);
-            let sq = _mm256_mullo_epi32(diff, diff);
-            let lo = _mm256_castsi256_si128(sq);
-            let hi = _mm256_extracti128_si256(sq, 1);
-            acc_lo = _mm256_add_epi64(acc_lo, _mm256_cvtepi32_epi64(lo));
-            acc_hi = _mm256_add_epi64(acc_hi, _mm256_cvtepi32_epi64(hi));
+        accumulate_dims_avx2(
+            block_ptr,
+            &q_i32,
+            PHASE1_END,
+            PHASE2_END,
+            &mut acc_lo,
+            &mut acc_hi,
+        );
+        if !any_below_avx2(acc_lo, acc_hi, &mut dists, lanes_in_block, worst) {
+            continue;
         }
+
+        accumulate_dims_avx2(block_ptr, &q_i32, PHASE2_END, DIM, &mut acc_lo, &mut acc_hi);
 
         _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
         _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
@@ -371,6 +356,49 @@ unsafe fn scan_cluster_avx2(
             );
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_dims_avx2(
+    block_ptr: *const i16,
+    q_i32: &[__m256i; DIM],
+    start: usize,
+    end: usize,
+    acc_lo: &mut __m256i,
+    acc_hi: &mut __m256i,
+) {
+    for j in start..end {
+        let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
+        let v = _mm256_cvtepi16_epi32(raw);
+        let diff = _mm256_sub_epi32(v, q_i32[j]);
+        let sq = _mm256_mullo_epi32(diff, diff);
+        let lo = _mm256_castsi256_si128(sq);
+        let hi = _mm256_extracti128_si256(sq, 1);
+        *acc_lo = _mm256_add_epi64(*acc_lo, _mm256_cvtepi32_epi64(lo));
+        *acc_hi = _mm256_add_epi64(*acc_hi, _mm256_cvtepi32_epi64(hi));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn any_below_avx2(
+    acc_lo: __m256i,
+    acc_hi: __m256i,
+    dists: &mut [i64; 8],
+    lanes_in_block: usize,
+    worst: i64,
+) -> bool {
+    _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
+    _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
+    for &d in dists.iter().take(lanes_in_block) {
+        if d < worst {
+            return true;
+        }
+    }
+    false
 }
 
 #[inline(always)]
