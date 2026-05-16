@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/whereisanzi/rinha-lb:67e9572
+    image: ghcr.io/whereisanzi/rinha-lb:2406c9e
     ports:
       - "9999:9999"
     environment:
@@ -28,8 +28,23 @@ services:
           cpus: "0.16"
           memory: "30M"
 
+  init:
+    image: ghcr.io/whereisanzi/rinha-index:2406c9e
+    volumes:
+      - resources:/resources
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:67e9572
+    image: ghcr.io/whereisanzi/rinha-api:2406c9e
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
@@ -38,7 +53,10 @@ services:
       - BACKLOG=4096
     volumes:
       - sockets:/sockets
-      - resources:/resources
+      - resources:/resources:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
@@ -50,11 +68,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
+          cpus: "0.37"
+          memory: "150M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:67e9572
+    image: ghcr.io/whereisanzi/rinha-api:2406c9e
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
@@ -64,6 +82,9 @@ services:
     volumes:
       - sockets:/sockets
       - resources:/resources:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
@@ -75,10 +96,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
-    depends_on:
-      - api1
+          cpus: "0.37"
+          memory: "150M"
 
 volumes:
   sockets:
