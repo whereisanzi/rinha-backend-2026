@@ -1,6 +1,6 @@
 FROM --platform=linux/amd64 rust:1.83-alpine AS builder
 
-ARG CATRACA_VERSION=v0.1.0
+ARG CATRACA_VERSION=v0.2.0
 
 RUN apk add --no-cache musl-dev git
 

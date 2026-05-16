@@ -11,6 +11,7 @@ services:
       - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
       - BUF_SIZE=4096
       - BACKLOG=4096
+      - HEALTH_PATH=/ready
     volumes:
       - sockets:/sockets
     depends_on:
