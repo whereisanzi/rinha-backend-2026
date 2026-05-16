@@ -31,6 +31,24 @@ services:
           cpus: "0.16"
           memory: "30M"
 
+  init:
+    image: rinha-index:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.index
+    volumes:
+      - resources:/resources
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp=unconfined
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
   api1:
     image: rinha-api:latest
     build:
@@ -44,7 +62,10 @@ services:
       - BACKLOG=4096
     volumes:
       - sockets:/sockets
-      - resources:/resources
+      - resources:/resources:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
@@ -56,8 +77,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
+          cpus: "0.37"
+          memory: "150M"
 
   api2:
     image: rinha-api:latest
@@ -70,6 +91,9 @@ services:
     volumes:
       - sockets:/sockets
       - resources:/resources:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
     networks:
       - rinha-net
     security_opt:
@@ -81,10 +105,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
-    depends_on:
-      - api1
+          cpus: "0.37"
+          memory: "150M"
 
 volumes:
   sockets:

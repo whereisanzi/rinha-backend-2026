@@ -24,8 +24,6 @@ FROM scratch
 
 COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/api /api
 
-COPY resources/index.bin /resources/index.bin
-
 ENV INDEX_PATH=/resources/index.bin
 
 ENTRYPOINT ["/api"]

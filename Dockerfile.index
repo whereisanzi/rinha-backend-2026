@@ -1,0 +1,5 @@
+FROM --platform=linux/amd64 busybox:musl
+
+COPY resources/index.bin /index.bin
+
+ENTRYPOINT ["sh", "-c", "cp /index.bin /resources/index.bin"]
