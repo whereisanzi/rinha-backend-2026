@@ -11,10 +11,6 @@ const BITSET_WORDS: usize = (MAX_K + 63) / 64;
 const FAST_NPROBE: usize = 8;
 const REPAIR_MIN: u8 = 2;
 const REPAIR_MAX: u8 = 3;
-#[cfg(target_arch = "x86_64")]
-const PHASE1_END: usize = 5;
-#[cfg(target_arch = "x86_64")]
-const PHASE2_END: usize = 10;
 
 #[inline(always)]
 fn bitset_set(bs: &mut [u64; BITSET_WORDS], i: usize) {
@@ -298,14 +294,30 @@ unsafe fn scan_cluster_avx2(
     top5: &mut [Top5; 5],
     worst_idx: &mut usize,
 ) {
-    let mut q_i32 = [_mm256_setzero_si256(); DIM];
-    for j in 0..DIM {
-        q_i32[j] = _mm256_set1_epi32(q[j] as i32);
+    // Pre-compute q broadcast for each PAIR of dims.
+    // For pair (j, j+1) we want a vector that, after the same
+    // _mm_unpacklo/hi pattern applied to the loaded block bytes,
+    // matches lane-wise. We pack q[j] and q[j+1] interleaved so a
+    // single _mm256_sub_epi16 against the unpacked block gives
+    // (q[j] - v[j], q[j+1] - v[j+1], ...) per lane.
+    // 14 dims = 7 pairs.
+    let mut q_pairs = [_mm256_setzero_si256(); DIM / 2];
+    for p in 0..(DIM / 2) {
+        let a = _mm_set1_epi16(q[2 * p]);
+        let b = _mm_set1_epi16(q[2 * p + 1]);
+        let lo = _mm_unpacklo_epi16(a, b); // [a,b,a,b, a,b,a,b]
+        // _mm_unpacklo_epi16 of two splatted vectors gives an interleaved 128-bit.
+        // Broadcast that to both halves of a 256-bit register.
+        q_pairs[p] = _mm256_broadcastsi128_si256(lo);
     }
 
     let blocks_ptr = ds.blocks.as_ptr();
     let mut dists = [0i64; 8];
     let num_blocks = block_end - block_start;
+
+    // Check between pair index 4 and 5 (after 8 dims = pairs 0..4 done).
+    // Matches the previous "EARLY_TERM_DIM = 8" gate.
+    const EARLY_PAIR: usize = 4;
 
     for block_local in 0..num_blocks {
         let block_idx = block_start + block_local;
@@ -324,24 +336,16 @@ unsafe fn scan_cluster_avx2(
         let lanes_in_block = (cluster_size - block_local * BLOCK_SIZE).min(BLOCK_SIZE);
         let worst = top5[*worst_idx].dist;
 
-        accumulate_dims_avx2(block_ptr, &q_i32, 0, PHASE1_END, &mut acc_lo, &mut acc_hi);
+        for p in 0..EARLY_PAIR {
+            accumulate_pair_avx2(block_ptr, q_pairs[p], 2 * p, &mut acc_lo, &mut acc_hi);
+        }
         if !any_below_avx2(acc_lo, acc_hi, &mut dists, lanes_in_block, worst) {
             continue;
         }
 
-        accumulate_dims_avx2(
-            block_ptr,
-            &q_i32,
-            PHASE1_END,
-            PHASE2_END,
-            &mut acc_lo,
-            &mut acc_hi,
-        );
-        if !any_below_avx2(acc_lo, acc_hi, &mut dists, lanes_in_block, worst) {
-            continue;
+        for p in EARLY_PAIR..(DIM / 2) {
+            accumulate_pair_avx2(block_ptr, q_pairs[p], 2 * p, &mut acc_lo, &mut acc_hi);
         }
-
-        accumulate_dims_avx2(block_ptr, &q_i32, PHASE2_END, DIM, &mut acc_lo, &mut acc_hi);
 
         _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, acc_lo);
         _mm256_storeu_si256((dists.as_mut_ptr() as *mut __m256i).add(1), acc_hi);
@@ -358,27 +362,42 @@ unsafe fn scan_cluster_avx2(
     }
 }
 
+/// Process a pair of dimensions (j, j+1) for the current block.
+///
+/// Layout reminder: a block stores dim j's 8 lanes at block_ptr + j*8 as 8
+/// contiguous i16, then dim j+1's 8 lanes at block_ptr + (j+1)*8. We load
+/// both halves, interleave them with unpack so each 32-bit slot becomes
+/// (v_lane_j, v_lane_j+1), subtract the same-shape q_pair, then use
+/// _mm256_madd_epi16 which pair-wise multiplies and horizontally adds
+/// (q-v)² + (q-v)² for the two dims per lane in a single instruction.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn accumulate_dims_avx2(
+unsafe fn accumulate_pair_avx2(
     block_ptr: *const i16,
-    q_i32: &[__m256i; DIM],
-    start: usize,
-    end: usize,
+    q_pair: __m256i,
+    j: usize,
     acc_lo: &mut __m256i,
     acc_hi: &mut __m256i,
 ) {
-    for j in start..end {
-        let raw = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
-        let v = _mm256_cvtepi16_epi32(raw);
-        let diff = _mm256_sub_epi32(v, q_i32[j]);
-        let sq = _mm256_mullo_epi32(diff, diff);
-        let lo = _mm256_castsi256_si128(sq);
-        let hi = _mm256_extracti128_si256(sq, 1);
-        *acc_lo = _mm256_add_epi64(*acc_lo, _mm256_cvtepi32_epi64(lo));
-        *acc_hi = _mm256_add_epi64(*acc_hi, _mm256_cvtepi32_epi64(hi));
-    }
+    let r0 = _mm_loadu_si128(block_ptr.add(j * BLOCK_SIZE) as *const __m128i);
+    let r1 = _mm_loadu_si128(block_ptr.add((j + 1) * BLOCK_SIZE) as *const __m128i);
+    // Interleave i16: pair lane k's (dim_j, dim_j+1) into adjacent positions.
+    let inter_lo = _mm_unpacklo_epi16(r0, r1); // lanes 0..3
+    let inter_hi = _mm_unpackhi_epi16(r0, r1); // lanes 4..7
+    let v_pair = _mm256_set_m128i(inter_hi, inter_lo);
+
+    let diff = _mm256_sub_epi16(q_pair, v_pair);
+    // _mm256_madd_epi16: returns 8 × i32, each = (diff[2k])² + (diff[2k+1])²
+    let sq = _mm256_madd_epi16(diff, diff);
+
+    // Widen i32 → i64 and add to accumulator (i64 to avoid overflow
+    // across the 7-pair sum: max sum per lane ≈ 7 × (2 × (2·FIX_SCALE)²)
+    // ≈ 5.6e9, which would overflow i32).
+    let lo = _mm256_castsi256_si128(sq);
+    let hi = _mm256_extracti128_si256(sq, 1);
+    *acc_lo = _mm256_add_epi64(*acc_lo, _mm256_cvtepi32_epi64(lo));
+    *acc_hi = _mm256_add_epi64(*acc_hi, _mm256_cvtepi32_epi64(hi));
 }
 
 #[cfg(target_arch = "x86_64")]
