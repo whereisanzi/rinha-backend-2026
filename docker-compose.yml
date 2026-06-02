@@ -29,13 +29,15 @@ services:
           memory: "30M"
 
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:4686c30
+    image: ghcr.io/whereisanzi/rinha-api:acaf916
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
       - UDS_MODE=438
-      - NPROBE=1
       - BACKLOG=4096
+      - SEARCH=0
+      - FAST_NPROBE=4
+      - SCHED=fifo
       - RINHA_CPU=0
     volumes:
       - sockets:/sockets
@@ -58,13 +60,15 @@ services:
           memory: "160M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:4686c30
+    image: ghcr.io/whereisanzi/rinha-api:acaf916
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
       - UDS_MODE=438
-      - NPROBE=1
       - BACKLOG=4096
+      - SEARCH=0
+      - FAST_NPROBE=4
+      - SCHED=fifo
       - RINHA_CPU=2
     volumes:
       - sockets:/sockets
