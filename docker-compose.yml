@@ -19,8 +19,6 @@ services:
       - api2
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -40,7 +38,6 @@ services:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
       - UDS_MODE=438
-      - NPROBE=1
       - BACKLOG=4096
       - RINHA_CPU=0
       - SEARCH=${SEARCH:-0}
@@ -50,8 +47,6 @@ services:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -72,7 +67,6 @@ services:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
       - UDS_MODE=438
-      - NPROBE=1
       - BACKLOG=4096
       - RINHA_CPU=2
       - SEARCH=${SEARCH:-0}
@@ -82,8 +76,6 @@ services:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
