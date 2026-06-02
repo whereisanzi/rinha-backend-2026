@@ -1,33 +1,26 @@
 #[cfg(target_os = "linux")]
 mod ctrl;
-mod dataset;
-mod http;
-mod ivf;
-mod json;
-mod responses;
 #[cfg(target_os = "linux")]
 mod server;
-mod vectorizer;
 
 use std::path::PathBuf;
 #[cfg(not(target_os = "linux"))]
 use std::time::Instant;
 
-pub const DIM: usize = 14;
+use api::dataset;
+#[cfg(not(target_os = "linux"))]
+use api::ivf;
+#[cfg(not(target_os = "linux"))]
+use api::DIM;
+#[cfg(not(target_os = "linux"))]
+use api::{json, vectorizer};
 
 fn env_path(name: &str, default: &str) -> PathBuf {
     PathBuf::from(std::env::var(name).unwrap_or_else(|_| default.to_string()))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-#[cfg(target_os = "linux")]
-fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name)
         .ok()
         .and_then(|s| s.parse().ok())
@@ -41,13 +34,16 @@ fn main() -> std::io::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let uds_mode = std::env::var("UDS_MODE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0o666u32);
         let cfg = server::Config {
             uds_path: std::env::var("UDS_PATH")
                 .unwrap_or_else(|_| "/sockets/api.sock".to_string()),
-            uds_mode: env_usize("UDS_MODE", 0o666) as u32,
-            nprobe: env_usize("NPROBE", ivf::nprobe_default()),
-            backlog: env_i32("BACKLOG", 4096),
+            uds_mode,
             cpu_pin: std::env::var("RINHA_CPU").ok().and_then(|s| s.parse().ok()),
+            search_mode: std::env::var("SEARCH").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
         };
         return server::run(cfg, ds);
     }
@@ -79,6 +75,7 @@ fn bench(ds: &dataset::Dataset) {
         let p50 = samples[samples.len() / 2];
         let p99 = samples[samples.len() * 99 / 100];
         let max = *samples.last().unwrap();
+        let _ = DIM;
         eprintln!(
             "{} bench (n=1000): p50={}.{}µs p99={}.{}µs max={}.{}µs",
             name,

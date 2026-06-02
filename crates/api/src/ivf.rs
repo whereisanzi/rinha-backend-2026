@@ -3,14 +3,28 @@ use crate::dataset::{BLOCK_SIZE, BLOCK_STRIDE, Dataset};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::sync::LazyLock;
 
 const NPROBE_DEFAULT: usize = 8;
 pub const FIX_SCALE: f32 = 10_000.0;
-const MAX_K: usize = 4096;
+const MAX_K: usize = 8192;
 const BITSET_WORDS: usize = (MAX_K + 63) / 64;
-const FAST_NPROBE: usize = 8;
+const MAX_PROBE: usize = 256;
 const REPAIR_MIN: u8 = 2;
 const REPAIR_MAX: u8 = 3;
+
+/// Number of nearest centroids scanned in the fast pass before the exact
+/// bbox-pruned repair. Higher → tighter initial top-5 bound → fewer clusters
+/// survive the repair scan, but more vectors scanned up front. Tunable via env
+/// (`FAST_NPROBE`) for offline sweeps; it affects speed only, never correctness
+/// (the repair pass is exact regardless).
+static FAST_NPROBE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("FAST_NPROBE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .clamp(1, MAX_PROBE)
+});
 
 #[inline(always)]
 fn bitset_set(bs: &mut [u64; BITSET_WORDS], i: usize) {
@@ -35,7 +49,23 @@ const SENTINEL: Top5 = Top5 {
     orig_id: u32::MAX,
 };
 
+/// Gated search (current/legacy behaviour): runs the fast probe set, then only
+/// escalates to the exact bbox-pruned full pass when the fast fraud count is
+/// borderline (`[REPAIR_MIN, REPAIR_MAX]`). Approximate — kept for A/B.
 pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, _nprobe: usize) -> u8 {
+    search_impl(query, ds, true)
+}
+
+/// Exact search: always runs the bbox-pruned full pass. The bbox lower bound is
+/// an exact admissibility test (a cluster whose bounding box is farther than the
+/// current 5th-best cannot contain a true neighbour), so the result is identical
+/// to brute-force k-NN with lowest-index tie-break.
+pub fn search_fraud_count_exact(query: &[f32; DIM], ds: &Dataset) -> u8 {
+    search_impl(query, ds, false)
+}
+
+#[inline]
+fn search_impl(query: &[f32; DIM], ds: &Dataset, gated: bool) -> u8 {
     let mut q_i16 = [0i16; DIM];
     for j in 0..DIM {
         q_i16[j] = quantize_i16(query[j]);
@@ -46,22 +76,26 @@ pub fn search_fraud_count(query: &[f32; DIM], ds: &Dataset, _nprobe: usize) -> u
     let k_pad = ds.k_pad.min(MAX_K);
     compute_centroid_dists_i16(&q_i16, ds, &mut cdists, k_pad);
 
-    let fast_probes = top_n_centroids::<FAST_NPROBE>(&cdists[..k]);
+    let nprobe = (*FAST_NPROBE).min(k);
+    let mut probe_buf = [0usize; MAX_PROBE];
+    top_n_centroids(&cdists[..k], &mut probe_buf[..nprobe]);
 
     let mut top5 = [SENTINEL; 5];
     let mut worst_idx = 0usize;
     let mut scanned = [0u64; BITSET_WORDS];
 
-    for &c in fast_probes.iter() {
+    for &c in probe_buf[..nprobe].iter() {
         if !bitset_get(&scanned, c) {
             bitset_set(&mut scanned, c);
             scan_cluster(c, &q_i16, ds, &mut top5, &mut worst_idx);
         }
     }
 
-    let fast_count: u8 = top5.iter().map(|e| e.label as u8).sum();
-    if fast_count < REPAIR_MIN || fast_count > REPAIR_MAX {
-        return fast_count.min(5);
+    if gated {
+        let fast_count: u8 = top5.iter().map(|e| e.label as u8).sum();
+        if fast_count < REPAIR_MIN || fast_count > REPAIR_MAX {
+            return fast_count.min(5);
+        }
     }
 
     for c in 0..k {
@@ -98,26 +132,25 @@ fn bbox_lower_bound(q: &[i16; DIM], ds: &Dataset, c: usize) -> i64 {
     s
 }
 
-fn top_n_centroids<const N: usize>(dists: &[u32]) -> [usize; N] {
-    let mut top_d = [u32::MAX; N];
-    let mut top_i = [0usize; N];
+fn top_n_centroids(dists: &[u32], out: &mut [usize]) {
+    let n = out.len();
+    let mut top_d = [u32::MAX; MAX_PROBE];
     for (c, &d) in dists.iter().enumerate() {
-        if d < top_d[N - 1] {
-            let mut pos = N - 1;
+        if d < top_d[n - 1] {
+            let mut pos = n - 1;
             while pos > 0 && d < top_d[pos - 1] {
                 pos -= 1;
             }
-            let mut i = N - 1;
+            let mut i = n - 1;
             while i > pos {
                 top_d[i] = top_d[i - 1];
-                top_i[i] = top_i[i - 1];
+                out[i] = out[i - 1];
                 i -= 1;
             }
             top_d[pos] = d;
-            top_i[pos] = c;
+            out[pos] = c;
         }
     }
-    top_i
 }
 
 #[inline(always)]

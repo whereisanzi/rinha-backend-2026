@@ -43,6 +43,9 @@ services:
       - NPROBE=1
       - BACKLOG=4096
       - RINHA_CPU=0
+      - SEARCH=${SEARCH:-0}
+      - SCHED=${SCHED:-fifo}
+      - FAST_NPROBE=${FAST_NPROBE:-4}
     volumes:
       - sockets:/sockets
     networks:
@@ -72,6 +75,9 @@ services:
       - NPROBE=1
       - BACKLOG=4096
       - RINHA_CPU=2
+      - SEARCH=${SEARCH:-0}
+      - SCHED=${SCHED:-fifo}
+      - FAST_NPROBE=${FAST_NPROBE:-4}
     volumes:
       - sockets:/sockets
     networks:
