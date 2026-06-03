@@ -1,12 +1,11 @@
 services:
   lb:
-    image: ghcr.io/whereisanzi/rinha-lb:4686c30
+    image: ghcr.io/whereisanzi/rinha-lb:41ff5b3
     ports:
       - "9999:9999"
     environment:
       - PORT=9999
       - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
-      - BUF_SIZE=4096
       - BACKLOG=4096
       - HEALTH_PATH=/ready
     volumes:
@@ -16,8 +15,6 @@ services:
       - api2
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -29,7 +26,7 @@ services:
           memory: "30M"
 
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:acaf916
+    image: ghcr.io/whereisanzi/rinha-api:41ff5b3
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
@@ -37,14 +34,11 @@ services:
       - BACKLOG=4096
       - SEARCH=0
       - FAST_NPROBE=4
-      - SCHED=fifo
-      - RINHA_CPU=0
+      - SCHED=other
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -52,7 +46,6 @@ services:
       memlock:
         soft: -1
         hard: -1
-      rtprio: 99
     deploy:
       resources:
         limits:
@@ -60,7 +53,7 @@ services:
           memory: "160M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:acaf916
+    image: ghcr.io/whereisanzi/rinha-api:41ff5b3
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
@@ -68,14 +61,11 @@ services:
       - BACKLOG=4096
       - SEARCH=0
       - FAST_NPROBE=4
-      - SCHED=fifo
-      - RINHA_CPU=2
+      - SCHED=other
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -83,7 +73,6 @@ services:
       memlock:
         soft: -1
         hard: -1
-      rtprio: 99
     deploy:
       resources:
         limits:
