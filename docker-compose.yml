@@ -43,6 +43,7 @@ services:
       - SEARCH=${SEARCH:-0}
       - SCHED=${SCHED:-fifo}
       - FAST_NPROBE=${FAST_NPROBE:-4}
+      - SPIN_US=${SPIN_US:-0}
     volumes:
       - sockets:/sockets
     networks:
@@ -72,6 +73,7 @@ services:
       - SEARCH=${SEARCH:-0}
       - SCHED=${SCHED:-fifo}
       - FAST_NPROBE=${FAST_NPROBE:-4}
+      - SPIN_US=${SPIN_US:-0}
     volumes:
       - sockets:/sockets
     networks:

@@ -76,15 +76,22 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
     }
     epoll_add(epfd, ctrl_fd);
 
+    // Busy-poll window (env SPIN_US): after an idle epoll_wait, spin with a
+    // 0-timeout epoll_wait for up to SPIN_US microseconds before blocking. Trades
+    // a little CPU for eliminating scheduler wakeup latency when the next request
+    // arrives soon — the dominant tail cost under CPU contention. 0 = always block.
+    let spin_us: u64 = std::env::var("SPIN_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     // Per-fd connection state, indexed by raw fd. ~512 KB of pointers; the 4 KB
     // buffers are heap-allocated only for live connections.
     let mut conns: Vec<Option<Box<Conn>>> = (0..MAX_FD).map(|_| None).collect();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
     loop {
-        let n = unsafe {
-            libc::epoll_wait(epfd, events.as_mut_ptr(), MAX_EVENTS as i32, -1)
-        };
+        let n = wait_events(epfd, events.as_mut_ptr(), spin_us);
         if n < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -100,6 +107,27 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
             }
         }
     }
+}
+
+/// One epoll wait: try a non-blocking poll first; if idle and spin_us>0, spin
+/// polling for up to spin_us microseconds; otherwise block indefinitely.
+#[inline]
+fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64) -> i32 {
+    let n = unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, 0) };
+    if n != 0 {
+        return n;
+    }
+    if spin_us > 0 {
+        let start = std::time::Instant::now();
+        while (start.elapsed().as_micros() as u64) < spin_us {
+            std::hint::spin_loop();
+            let n = unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, 0) };
+            if n != 0 {
+                return n;
+            }
+        }
+    }
+    unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, -1) }
 }
 
 fn accept_new_fds(ctrl_fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>]) {

@@ -26,10 +26,19 @@ fi
 echo "=== up (CORES=$CORES SEARCH=${SEARCH:-0} FAST_NPROBE=${FAST_NPROBE:-4} SCHED=${SCHED:-fifo} RINHA_CPU1=${RINHA_CPU1:-0} RINHA_CPU2=${RINHA_CPU2:-2}) ==="
 docker compose -f "$COMPOSE" --compatibility up -d 2>&1 | tail -3
 
-# Confine every service container to CORES so the stack + k6 share the same cpus.
-ids=$(docker compose -f "$COMPOSE" ps -q)
-for id in $ids; do docker update --cpuset-cpus "$CORES" "$id" >/dev/null; done
-echo "confined containers to cpus $CORES"
+# Per-service cpuset (mimics the fast teams: api1/api2 on dedicated physical
+# cores, lb on the HT siblings). C1/C2/CLB override; PIN=0 disables (confine all
+# to CORES, like the old behaviour).
+if [ "${PIN:-1}" = "1" ]; then
+  C1="${C1:-0}"; C2="${C2:-1}"; CLB="${CLB:-6,7}"
+  docker update --cpuset-cpus "$C1"  "$(docker compose -f "$COMPOSE" ps -q api1)" >/dev/null
+  docker update --cpuset-cpus "$C2"  "$(docker compose -f "$COMPOSE" ps -q api2)" >/dev/null
+  docker update --cpuset-cpus "$CLB" "$(docker compose -f "$COMPOSE" ps -q lb)"   >/dev/null
+  echo "cpuset: api1=$C1 api2=$C2 lb=$CLB ; k6 pinned to $CORES"
+else
+  for id in $(docker compose -f "$COMPOSE" ps -q); do docker update --cpuset-cpus "$CORES" "$id" >/dev/null; done
+  echo "confined all containers to cpus $CORES (no per-service pin)"
+fi
 
 ok=0
 for i in $(seq 1 30); do curl -sf -o /dev/null http://localhost:9999/ready && { ok=1; break; }; sleep 1; done
