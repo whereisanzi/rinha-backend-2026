@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/whereisanzi/rinha-lb:0d2f527
+    image: ghcr.io/whereisanzi/rinha-lb:ad8c8d5
     ports:
       - "9999:9999"
     environment:
@@ -15,6 +15,7 @@ services:
       - api2
     networks:
       - rinha-net
+    cpuset: "2,3"
     ulimits:
       nofile:
         soft: 65535
@@ -22,11 +23,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.16"
-          memory: "30M"
+          cpus: "0.10"
+          memory: "20M"
 
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:0d2f527
+    image: ghcr.io/whereisanzi/rinha-api:ad8c8d5
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
@@ -35,10 +36,12 @@ services:
       - SEARCH=0
       - FAST_NPROBE=4
       - SCHED=other
+      - BUSY_POLL_US=50
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
+    cpuset: "0"
     ulimits:
       nofile:
         soft: 65535
@@ -49,11 +52,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
+          cpus: "0.45"
+          memory: "165M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:0d2f527
+    image: ghcr.io/whereisanzi/rinha-api:ad8c8d5
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
@@ -62,10 +65,12 @@ services:
       - SEARCH=0
       - FAST_NPROBE=4
       - SCHED=other
+      - BUSY_POLL_US=50
     volumes:
       - sockets:/sockets
     networks:
       - rinha-net
+    cpuset: "1"
     ulimits:
       nofile:
         soft: 65535
@@ -76,8 +81,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.42"
-          memory: "160M"
+          cpus: "0.45"
+          memory: "165M"
     depends_on:
       - api1
 
