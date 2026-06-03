@@ -87,12 +87,16 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let idle_us: i64 = std::env::var("EPOLL_IDLE_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let mut conns: Vec<Option<Box<Conn>>> = (0..MAX_FD).map(|_| None).collect();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
     loop {
-        let n = wait_events(epfd, events.as_mut_ptr(), spin_us);
+        let n = wait_events(epfd, events.as_mut_ptr(), spin_us, idle_us);
         if n < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
@@ -111,7 +115,7 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
 }
 
 #[inline]
-fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64) -> i32 {
+fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64, idle_us: i64) -> i32 {
     let n = unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, 0) };
     if n != 0 {
         return n;
@@ -124,6 +128,26 @@ fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64) -> i32
             if n != 0 {
                 return n;
             }
+        }
+    }
+    if idle_us > 0 {
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: idle_us * 1000,
+        };
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_epoll_pwait2,
+                epfd as libc::c_long,
+                events as libc::c_long,
+                MAX_EVENTS as libc::c_long,
+                &ts as *const libc::timespec as libc::c_long,
+                0i64,
+                0i64,
+            )
+        };
+        if r >= 0 {
+            return r as i32;
         }
     }
     unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, -1) }
