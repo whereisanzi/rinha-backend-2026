@@ -6,11 +6,16 @@ use std::slice;
 
 use crate::DIM;
 
-pub const MAGIC: &[u8; 4] = b"RIVF";
-pub const VERSION: u32 = 2;
-pub const HEADER_SIZE: usize = 32;
-pub const BLOCK_SIZE: usize = 8;
-pub const BLOCK_STRIDE: usize = DIM * BLOCK_SIZE;
+pub const MAGIC: &[u8; 8] = b"DFKDP001";
+pub const VERSION: u32 = 1;
+pub const HEADER_SIZE: usize = 44;
+pub const STORE_DIM: usize = 16;
+pub const LANES: usize = 8;
+pub const BLOCK_I16: usize = DIM * LANES;
+pub const BLOCK_BYTES: usize = BLOCK_I16 * 2;
+pub const PART_SIZE: usize = 8 + STORE_DIM * 4;
+pub const NODE_SIZE: usize = 16 + STORE_DIM * 4;
+pub const SCALE: i32 = 10_000;
 
 #[cfg(target_os = "linux")]
 const MAP_POPULATE: libc::c_int = 0x8000;
@@ -25,28 +30,26 @@ const MADV_WILLNEED: libc::c_int = 3;
 pub struct Dataset {
     pub n: usize,
     pub k: usize,
-    pub k_pad: usize,
-    #[allow(dead_code)]
-    pub scale: f32,
-    #[allow(dead_code)]
-    pub centroids: &'static [f32],
-    #[allow(dead_code)]
-    pub centroids_soa: &'static [f32],
-    pub centroids_soa_i16: &'static [i16],
-    pub bbox_min: &'static [i16],
-    pub bbox_max: &'static [i16],
-    pub offsets: &'static [u32],
-    pub block_offsets: &'static [u32],
+    pub part_keys: &'static [u32],
+    pub part_roots: &'static [i32],
+    pub part_min: &'static [i16],
+    pub part_max: &'static [i16],
+    pub node_left: &'static [i32],
+    pub node_right: &'static [i32],
+    pub node_start: &'static [i32],
+    pub node_len: &'static [i32],
+    pub node_min: &'static [i16],
+    pub node_max: &'static [i16],
     pub blocks: &'static [i16],
     pub labels: &'static [u8],
-    pub orig_ids: &'static [u32],
+    pub part_by_key: [i32; 256],
 }
 
 pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
     let file = OpenOptions::new().read(true).open(path)?;
     let len = file.metadata()?.len() as usize;
-    if len == 0 {
-        return Err(io_err("empty index file"));
+    if len < HEADER_SIZE {
+        return Err(io_err("index file smaller than header"));
     }
 
     let ptr = unsafe {
@@ -76,102 +79,80 @@ pub fn load(path: &Path) -> std::io::Result<&'static Dataset> {
 
     let bytes: &'static [u8] = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
 
-    if bytes.len() < HEADER_SIZE {
-        return Err(io_err("index file smaller than header"));
-    }
-    if &bytes[0..4] != MAGIC {
+    if &bytes[0..8] != MAGIC {
         return Err(io_err("bad magic"));
     }
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     if version != VERSION {
         return Err(io_err("bad version"));
     }
-    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let k = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    let d = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-    let scale = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
-    if d != DIM {
-        return Err(io_err("dim mismatch"));
+    let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let store_dim = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let scale = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as i32;
+    if dim != DIM || store_dim != STORE_DIM || scale != SCALE {
+        return Err(io_err("dim/scale mismatch"));
     }
+    let n = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+    let part_count = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+    let node_count = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+    let block_count = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
 
     let mut off = HEADER_SIZE;
 
-    let centroids_bytes = k * DIM * 4;
-    let centroids = unsafe { slice_typed::<f32>(bytes, off, k * DIM) };
-    off += centroids_bytes;
+    let part_keys = unsafe { slice_typed::<u32>(bytes, off, part_count) };
+    off += part_count * 4;
+    let part_roots = unsafe { slice_typed::<i32>(bytes, off, part_count) };
+    off += part_count * 4;
+    let part_min = unsafe { slice_typed::<i16>(bytes, off, part_count * STORE_DIM) };
+    off += part_count * STORE_DIM * 2;
+    let part_max = unsafe { slice_typed::<i16>(bytes, off, part_count * STORE_DIM) };
+    off += part_count * STORE_DIM * 2;
 
-    let bbox_bytes = k * DIM * 2;
-    let bbox_min = unsafe { slice_typed::<i16>(bytes, off, k * DIM) };
-    off += bbox_bytes;
-    let bbox_max = unsafe { slice_typed::<i16>(bytes, off, k * DIM) };
-    off += bbox_bytes;
+    let node_left = unsafe { slice_typed::<i32>(bytes, off, node_count) };
+    off += node_count * 4;
+    let node_right = unsafe { slice_typed::<i32>(bytes, off, node_count) };
+    off += node_count * 4;
+    let node_start = unsafe { slice_typed::<i32>(bytes, off, node_count) };
+    off += node_count * 4;
+    let node_len = unsafe { slice_typed::<i32>(bytes, off, node_count) };
+    off += node_count * 4;
+    let node_min = unsafe { slice_typed::<i16>(bytes, off, node_count * STORE_DIM) };
+    off += node_count * STORE_DIM * 2;
+    let node_max = unsafe { slice_typed::<i16>(bytes, off, node_count * STORE_DIM) };
+    off += node_count * STORE_DIM * 2;
 
-    let offsets_bytes = (k + 1) * 4;
-    let offsets = unsafe { slice_typed::<u32>(bytes, off, k + 1) };
-    off += offsets_bytes;
-
-    let block_offsets = unsafe { slice_typed::<u32>(bytes, off, k + 1) };
-    off += offsets_bytes;
-    let total_blocks = block_offsets[k] as usize;
-
-    let blocks_count = total_blocks * BLOCK_STRIDE;
-    let blocks = unsafe { slice_typed::<i16>(bytes, off, blocks_count) };
-    off += blocks_count * 2;
-
-    let labels = &bytes[off..off + n];
-    off += n;
-
-    let orig_ids = unsafe { slice_typed::<u32>(bytes, off, n) };
-    off += n * 4;
+    let blocks = unsafe { slice_typed::<i16>(bytes, off, block_count * BLOCK_I16) };
+    off += block_count * BLOCK_BYTES;
+    let labels = &bytes[off..off + block_count * LANES];
+    off += block_count * LANES;
 
     if off != bytes.len() {
         return Err(io_err("index file has unexpected trailing data"));
     }
-    if offsets[k] as usize != n {
-        return Err(io_err("offsets[k] != n"));
-    }
 
-    let k_pad = (k + 7) & !7;
-    let mut centroids_soa_vec = vec![0.0f32; DIM * k_pad];
-    for c in 0..k {
-        for j in 0..DIM {
-            centroids_soa_vec[j * k_pad + c] = centroids[c * DIM + j];
+    let mut part_by_key = [-1i32; 256];
+    for (i, &key) in part_keys.iter().enumerate() {
+        if (key as usize) < 256 {
+            part_by_key[key as usize] = i as i32;
         }
     }
-    for c in k..k_pad {
-        for j in 0..DIM {
-            centroids_soa_vec[j * k_pad + c] = f32::INFINITY;
-        }
-    }
-    let centroids_soa: &'static [f32] = Vec::leak(centroids_soa_vec);
-
-    let mut centroids_soa_i16_vec = vec![i16::MAX; DIM * k_pad];
-    for c in 0..k {
-        for j in 0..DIM {
-            let v = centroids[c * DIM + j];
-            let clamped = v.clamp(-1.0, 1.0);
-            let s = clamped * scale;
-            let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
-            centroids_soa_i16_vec[j * k_pad + c] = r as i16;
-        }
-    }
-    let centroids_soa_i16: &'static [i16] = Vec::leak(centroids_soa_i16_vec);
 
     let ds = Box::leak(Box::new(Dataset {
         n,
-        k,
-        k_pad,
-        scale,
-        centroids,
-        centroids_soa,
-        centroids_soa_i16,
-        bbox_min,
-        bbox_max,
-        offsets,
-        block_offsets,
+        k: part_count,
+        part_keys,
+        part_roots,
+        part_min,
+        part_max,
+        node_left,
+        node_right,
+        node_start,
+        node_len,
+        node_min,
+        node_max,
         blocks,
         labels,
-        orig_ids,
+        part_by_key,
     }));
     Ok(ds)
 }
