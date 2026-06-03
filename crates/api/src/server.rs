@@ -200,39 +200,32 @@ fn handle_client(fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>], ds: &'
     if idx >= MAX_FD || conns[idx].is_none() {
         return;
     }
-    loop {
-        let conn = match conns[idx].as_mut() {
-            Some(c) => c,
-            None => return,
-        };
-        if conn.len >= REQ_BUF_SIZE {
-            let _ = send_all(fd, responses::RESP_PAYLOAD_TOO_LARGE);
-            close_conn(fd, epfd, conns);
-            return;
-        }
-        let n = unsafe {
+    if conns[idx].as_ref().unwrap().len >= REQ_BUF_SIZE {
+        let _ = send_all(fd, responses::RESP_PAYLOAD_TOO_LARGE);
+        close_conn(fd, epfd, conns);
+        return;
+    }
+    let n = {
+        let conn = conns[idx].as_mut().unwrap();
+        unsafe {
             libc::recv(
                 fd,
                 conn.buf.as_mut_ptr().add(conn.len) as *mut _,
                 REQ_BUF_SIZE - conn.len,
                 0,
             )
-        };
-        if n < 0 {
-
-            return;
         }
-        if n == 0 {
-            close_conn(fd, epfd, conns);
-            return;
-        }
-        conn.len += n as usize;
-
-        if !process_buffer(fd, conns, ds) {
-            close_conn(fd, epfd, conns);
-            return;
-        }
-
+    };
+    if n < 0 {
+        return;
+    }
+    if n == 0 {
+        close_conn(fd, epfd, conns);
+        return;
+    }
+    conns[idx].as_mut().unwrap().len += n as usize;
+    if !process_buffer(fd, conns, ds) {
+        close_conn(fd, epfd, conns);
     }
 }
 
