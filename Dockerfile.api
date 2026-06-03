@@ -10,12 +10,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
 COPY crates/build-index/Cargo.toml ./crates/build-index/Cargo.toml
 COPY crates/eval/Cargo.toml ./crates/eval/Cargo.toml
-RUN mkdir -p crates/api/src crates/build-index/src crates/eval/src \
+COPY crates/lb/Cargo.toml ./crates/lb/Cargo.toml
+RUN mkdir -p crates/api/src crates/build-index/src crates/eval/src crates/lb/src \
     && echo 'fn main() {}' > crates/api/src/main.rs \
     && echo 'fn main() {}' > crates/build-index/src/main.rs \
     && echo 'fn main() {}' > crates/eval/src/main.rs \
+    && echo 'fn main() {}' > crates/lb/src/main.rs \
     && cargo build --release --target x86_64-unknown-linux-musl -p api \
-    && rm -rf crates/api/src crates/build-index/src crates/eval/src
+    && rm -rf crates/api/src crates/build-index/src crates/eval/src crates/lb/src
 
 COPY crates/api/src ./crates/api/src
 RUN touch crates/api/src/main.rs \

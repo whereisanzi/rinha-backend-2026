@@ -1,17 +1,31 @@
 FROM --platform=linux/amd64 rust:1.83-alpine AS builder
 
-ARG CATRACA_VERSION=v0.3.0
+RUN apk add --no-cache musl-dev
 
-RUN apk add --no-cache musl-dev git
+WORKDIR /src
 
-RUN cargo install \
-    --git https://github.com/maracatu-labs/catraca \
-    --tag ${CATRACA_VERSION} \
-    --root /out \
-    catraca
+ENV RUSTFLAGS="-C target-cpu=haswell -C link-arg=-s"
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/api/Cargo.toml ./crates/api/Cargo.toml
+COPY crates/build-index/Cargo.toml ./crates/build-index/Cargo.toml
+COPY crates/eval/Cargo.toml ./crates/eval/Cargo.toml
+COPY crates/lb/Cargo.toml ./crates/lb/Cargo.toml
+RUN mkdir -p crates/api/src crates/build-index/src crates/eval/src crates/lb/src \
+    && echo 'fn main() {}' > crates/api/src/main.rs \
+    && echo 'fn main() {}' > crates/build-index/src/main.rs \
+    && echo 'fn main() {}' > crates/eval/src/main.rs \
+    && echo 'fn main() {}' > crates/lb/src/main.rs \
+    && cargo build --release --target x86_64-unknown-linux-musl -p lb \
+    && rm -rf crates/lb/src
+
+COPY crates/lb/src ./crates/lb/src
+RUN touch crates/lb/src/main.rs \
+    && cargo build --release --target x86_64-unknown-linux-musl -p lb \
+    && strip target/x86_64-unknown-linux-musl/release/lb
 
 FROM scratch
 
-COPY --from=builder /out/bin/catraca /lb
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/lb /lb
 
 ENTRYPOINT ["/lb"]

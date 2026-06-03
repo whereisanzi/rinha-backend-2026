@@ -39,7 +39,7 @@ services:
       - UDS_PATH=/sockets/api1.sock
       - UDS_MODE=438
       - BACKLOG=4096
-      - RINHA_CPU=0
+      - RINHA_CPU=${RINHA_CPU1-0}
       - SEARCH=${SEARCH:-0}
       - SCHED=${SCHED:-fifo}
       - FAST_NPROBE=${FAST_NPROBE:-4}
@@ -68,7 +68,7 @@ services:
       - UDS_PATH=/sockets/api2.sock
       - UDS_MODE=438
       - BACKLOG=4096
-      - RINHA_CPU=2
+      - RINHA_CPU=${RINHA_CPU2-2}
       - SEARCH=${SEARCH:-0}
       - SCHED=${SCHED:-fifo}
       - FAST_NPROBE=${FAST_NPROBE:-4}

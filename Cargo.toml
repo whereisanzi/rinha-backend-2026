@@ -4,6 +4,7 @@ members = [
     "crates/api",
     "crates/build-index",
     "crates/eval",
+    "crates/lb",
 ]
 
 [workspace.package]
