@@ -162,7 +162,9 @@ struct EpollParams {
 }
 
 // EPIOCSPARAMS = _IOW(0x8A, 0x01, struct epoll_params), kernel >= 6.9.
-const EPIOCSPARAMS: libc::c_ulong = 0x4008_8A01;
+// `as _` coerces to whatever `ioctl`'s request arg is (c_ulong on glibc,
+// c_int on musl).
+const EPIOCSPARAMS: u64 = 0x4008_8A01;
 
 fn configure_busy_poll(epfd: RawFd, usecs: u32) {
     let params = EpollParams {
@@ -171,7 +173,7 @@ fn configure_busy_poll(epfd: RawFd, usecs: u32) {
         prefer_busy_poll: 1,
         __pad: 0,
     };
-    let rc = unsafe { libc::ioctl(epfd, EPIOCSPARAMS, &params) };
+    let rc = unsafe { libc::ioctl(epfd, EPIOCSPARAMS as _, &params) };
     if rc != 0 {
         eprintln!(
             "EPIOCSPARAMS busy-poll not available (non-fatal): {}",
@@ -375,11 +377,13 @@ fn set_socket_options(fd: RawFd) {
         let bp = BUSY_POLL_US.load(std::sync::atomic::Ordering::Relaxed) as libc::c_int;
         if bp > 0 {
             // SO_BUSY_POLL: per-socket NAPI busy-poll (kernel >= 3.11), complements
-            // the epoll EPIOCSPARAMS busy-poll on kernels without it.
+            // the epoll EPIOCSPARAMS busy-poll on kernels without it. Defined
+            // manually since libc may not expose it for all targets.
+            const SO_BUSY_POLL: libc::c_int = 46;
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
-                libc::SO_BUSY_POLL,
+                SO_BUSY_POLL,
                 &bp as *const _ as *const _,
                 std::mem::size_of::<libc::c_int>() as _,
             );
