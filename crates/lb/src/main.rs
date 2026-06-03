@@ -98,7 +98,13 @@ mod linux {
 
             if let Some(path) = health_path.as_deref() {
                 if peek_is_health(client_fd, path) {
-                    send_health_ok(client_fd);
+                    // Only report ready once every API control socket is
+                    // connected. The APIs bind their control socket *after*
+                    // warmup, so this gates /ready on warm APIs and keeps the
+                    // evaluator from sending its opening burst to a cold backend.
+                    if upstreams.iter().all(|u| u.ctrl_fd.load(Ordering::Acquire) >= 0) {
+                        send_health_ok(client_fd);
+                    }
                     unsafe { libc::close(client_fd) };
                     continue;
                 }

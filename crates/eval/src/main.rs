@@ -472,16 +472,18 @@ fn run_runtime(entries: &[Entry], index_path: &str) -> std::io::Result<()> {
         })
         .collect();
 
-    for (name, exact) in [("ivf gated (current)", false), ("ivf exact (no gate)", true)] {
+    // method: 0=exact, 1=gated, 3=probe-only (matches server SEARCH modes)
+    let methods: &[(&str, u8)] = &[("exact", 0), ("probe-only", 3)];
+    for &(name, m) in methods {
         let mut results = Vec::with_capacity(queries.len());
         let mut times_ns = Vec::with_capacity(queries.len());
         let t = Instant::now();
         for (q, exp, is_edge) in &queries {
             let t0 = Instant::now();
-            let frauds = if exact {
-                api::ivf::search_fraud_count_exact(q, ds)
-            } else {
-                api::ivf::search_fraud_count(q, ds, api::ivf::nprobe_default())
+            let frauds = match m {
+                3 => api::ivf::search_fraud_count_probe(q, ds),
+                1 => api::ivf::search_fraud_count(q, ds, api::ivf::nprobe_default()),
+                _ => api::ivf::search_fraud_count_exact(q, ds),
             };
             times_ns.push(t0.elapsed().as_nanos() as u64);
             results.push((frauds < 3, *exp, *is_edge));

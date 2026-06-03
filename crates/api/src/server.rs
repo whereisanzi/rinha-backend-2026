@@ -9,7 +9,7 @@ use api::{ivf, json, responses, vectorizer};
 const REQ_BUF_SIZE: usize = 4096;
 const MAX_EVENTS: usize = 1024;
 const MAX_FD: usize = 65536;
-const PREWARM_ITERS: usize = 256;
+const PREWARM_ITERS: usize = 20_000;
 
 // Diagnostic search-mode toggle (env SEARCH): 0=exact (default), 1=gated, 2=null.
 // `null` skips the k-NN entirely to isolate server/scheduling latency from compute.
@@ -20,6 +20,7 @@ fn fraud_count(q: &[f32; api::DIM], ds: &'static Dataset) -> usize {
     match SEARCH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         1 => ivf::search_fraud_count(q, ds, ivf::nprobe_default()) as usize,
         2 => 0,
+        3 => ivf::search_fraud_count_probe(q, ds) as usize,
         _ => ivf::search_fraud_count_exact(q, ds) as usize,
     }
 }
@@ -60,9 +61,15 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
 
     pin_and_prioritize(cfg.cpu_pin);
 
+    // Warm up BEFORE binding the control socket. The load balancer only gates
+    // /ready true once it has connected to every API's control socket, so by
+    // delaying the bind until after warmup we guarantee the evaluator never
+    // sends traffic to a cold API — the cold-start burst would otherwise land
+    // in the p99 tail on the slow evaluator hardware.
+    prewarm(ds);
+
     let ctrl_path = format!("{}.ctrl", cfg.uds_path);
     let listener = ctrl::bind_ctrl_listener(&ctrl_path, cfg.uds_mode)?;
-    prewarm(ds);
 
     let (ctrl_conn, _addr) = listener.accept()?;
     let ctrl_fd = ctrl_conn.as_raw_fd();

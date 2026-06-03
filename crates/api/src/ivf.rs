@@ -64,6 +64,35 @@ pub fn search_fraud_count_exact(query: &[f32; DIM], ds: &Dataset) -> u8 {
     search_impl(query, ds, false)
 }
 
+/// Approximate search: scan only the `FAST_NPROBE` nearest clusters, no exact
+/// repair pass. Faster than exact but not guaranteed correct — only ship it if
+/// validated 0-error against multiple independently-generated payload sets.
+pub fn search_fraud_count_probe(query: &[f32; DIM], ds: &Dataset) -> u8 {
+    let mut q_i16 = [0i16; DIM];
+    for j in 0..DIM {
+        q_i16[j] = quantize_i16(query[j]);
+    }
+    let mut cdists = [u32::MAX; MAX_K];
+    let k = ds.k.min(MAX_K);
+    let k_pad = ds.k_pad.min(MAX_K);
+    compute_centroid_dists_i16(&q_i16, ds, &mut cdists, k_pad);
+
+    let nprobe = (*FAST_NPROBE).min(k);
+    let mut probe_buf = [0usize; MAX_PROBE];
+    top_n_centroids(&cdists[..k], &mut probe_buf[..nprobe]);
+
+    let mut top5 = [SENTINEL; 5];
+    let mut worst_idx = 0usize;
+    let mut scanned = [0u64; BITSET_WORDS];
+    for &c in probe_buf[..nprobe].iter() {
+        if !bitset_get(&scanned, c) {
+            bitset_set(&mut scanned, c);
+            scan_cluster(c, &q_i16, ds, &mut top5, &mut worst_idx);
+        }
+    }
+    top5.iter().map(|e| e.label as u8).sum::<u8>().min(5)
+}
+
 #[inline]
 fn search_impl(query: &[f32; DIM], ds: &Dataset, gated: bool) -> u8 {
     let mut q_i16 = [0i16; DIM];

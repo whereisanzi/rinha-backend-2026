@@ -1,0 +1,94 @@
+services:
+  lb:
+    image: ghcr.io/whereisanzi/rinha-lb:2feb251
+    ports:
+      - "9999:9999"
+    environment:
+      - PORT=9999
+      - UPSTREAMS=/sockets/api1.sock,/sockets/api2.sock
+      - BACKLOG=4096
+      - HEALTH_PATH=/ready
+    volumes:
+      - sockets:/sockets
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - rinha-net
+    cpuset: "${CPUSET_LB:-0,1}"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "${LB_CPUS:-0.10}"
+          memory: "20M"
+
+  api1:
+    image: ghcr.io/whereisanzi/rinha-api:2feb251
+    environment:
+      - INDEX_PATH=/resources/index.bin
+      - UDS_PATH=/sockets/api1.sock
+      - UDS_MODE=438
+      - BACKLOG=4096
+      - SEARCH=0
+      - FAST_NPROBE=4
+      - SCHED=other
+      - SPIN_US=${SPIN_US:-0}
+    volumes:
+      - sockets:/sockets
+    networks:
+      - rinha-net
+    cpuset: "${CPUSET_API1:-0}"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPUS:-0.45}"
+          memory: "165M"
+
+  api2:
+    image: ghcr.io/whereisanzi/rinha-api:2feb251
+    environment:
+      - INDEX_PATH=/resources/index.bin
+      - UDS_PATH=/sockets/api2.sock
+      - UDS_MODE=438
+      - BACKLOG=4096
+      - SEARCH=0
+      - FAST_NPROBE=4
+      - SCHED=other
+      - SPIN_US=${SPIN_US:-0}
+    volumes:
+      - sockets:/sockets
+    networks:
+      - rinha-net
+    cpuset: "${CPUSET_API2:-1}"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPUS:-0.45}"
+          memory: "165M"
+    depends_on:
+      - api1
+
+volumes:
+  sockets:
+
+networks:
+  rinha-net:
+    driver: bridge
