@@ -15,6 +15,10 @@ const PREWARM_ITERS: usize = 20_000;
 // `null` skips the k-NN entirely to isolate server/scheduling latency from compute.
 static SEARCH_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+// Busy-poll microseconds (env BUSY_POLL_US), shared with set_socket_options for
+// per-socket SO_BUSY_POLL (works on older kernels than the epoll EPIOCSPARAMS).
+static BUSY_POLL_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 #[inline]
 fn fraud_count(q: &[f32; api::DIM], ds: &'static Dataset) -> usize {
     match SEARCH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -83,10 +87,22 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
     }
     epoll_add(epfd, ctrl_fd);
 
-    // Busy-poll window (env SPIN_US): after an idle epoll_wait, spin with a
-    // 0-timeout epoll_wait for up to SPIN_US microseconds before blocking. Trades
-    // a little CPU for eliminating scheduler wakeup latency when the next request
-    // arrives soon — the dominant tail cost under CPU contention. 0 = always block.
+    // Kernel busy-poll (env BUSY_POLL_US): make epoll_wait poll the socket's NAPI
+    // queue in-kernel for up to N us before sleeping, so an arriving request is
+    // picked up without an IRQ->softirq->wakeup->reschedule round trip. This is
+    // what the top teams use (with cpuset pinning) to kill the wakeup-latency tail
+    // under 2-core contention. No-op on kernels < 6.9 / drivers without NAPI poll.
+    let busy_poll_us: u32 = std::env::var("BUSY_POLL_US")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    BUSY_POLL_US.store(busy_poll_us, std::sync::atomic::Ordering::Relaxed);
+    if busy_poll_us > 0 {
+        configure_busy_poll(epfd, busy_poll_us);
+    }
+
+    // Userspace busy-poll window (env SPIN_US): complementary 0-timeout epoll_wait
+    // spin before blocking. 0 = rely on kernel busy-poll / block.
     let spin_us: u64 = std::env::var("SPIN_US")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -135,6 +151,33 @@ fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64) -> i32
         }
     }
     unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, -1) }
+}
+
+#[repr(C)]
+struct EpollParams {
+    busy_poll_usecs: u32,
+    busy_poll_budget: u16,
+    prefer_busy_poll: u8,
+    __pad: u8,
+}
+
+// EPIOCSPARAMS = _IOW(0x8A, 0x01, struct epoll_params), kernel >= 6.9.
+const EPIOCSPARAMS: libc::c_ulong = 0x4008_8A01;
+
+fn configure_busy_poll(epfd: RawFd, usecs: u32) {
+    let params = EpollParams {
+        busy_poll_usecs: usecs,
+        busy_poll_budget: 8,
+        prefer_busy_poll: 1,
+        __pad: 0,
+    };
+    let rc = unsafe { libc::ioctl(epfd, EPIOCSPARAMS, &params) };
+    if rc != 0 {
+        eprintln!(
+            "EPIOCSPARAMS busy-poll not available (non-fatal): {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 fn accept_new_fds(ctrl_fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>]) {
@@ -312,9 +355,6 @@ fn set_nonblocking(fd: RawFd) {
     }
 }
 
-// TCP_NOTSENT_LOWAT is not in libc 0.2 for all arches.
-const TCP_NOTSENT_LOWAT: libc::c_int = 25;
-
 fn set_socket_options(fd: RawFd) {
     let one: libc::c_int = 1;
     unsafe {
@@ -332,13 +372,18 @@ fn set_socket_options(fd: RawFd) {
             &one as *const _ as *const _,
             std::mem::size_of::<libc::c_int>() as _,
         );
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            TCP_NOTSENT_LOWAT,
-            &one as *const _ as *const _,
-            std::mem::size_of::<libc::c_int>() as _,
-        );
+        let bp = BUSY_POLL_US.load(std::sync::atomic::Ordering::Relaxed) as libc::c_int;
+        if bp > 0 {
+            // SO_BUSY_POLL: per-socket NAPI busy-poll (kernel >= 3.11), complements
+            // the epoll EPIOCSPARAMS busy-poll on kernels without it.
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                &bp as *const _ as *const _,
+                std::mem::size_of::<libc::c_int>() as _,
+            );
+        }
     }
 }
 
