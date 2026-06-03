@@ -1,14 +1,4 @@
-// Offline detection oracle / harness.
-//
-// Loads the 3M reference vectors and the official 54_100-entry test set
-// (test/test-data.json, which carries `expected_approved` per entry as computed
-// by the reference C evaluator), runs an EXACT brute-force k=5 NN search with
-// the same squared-L2 metric and lowest-index tie-break as the evaluator, and
-// reports false positives / false negatives.
-//
-// Purpose: attribute our submitted 17 false positives to either feature
-// precision (f32 vs f64) or IVF approximation, and validate a 0-error recipe
-// WITHOUT spending public rinha submissions.
+
 
 use std::fs::File;
 use std::io::BufReader;
@@ -22,13 +12,6 @@ use serde::de::{Deserializer, SeqAccess, Visitor};
 
 const DIM: usize = 14;
 const KNN_K: usize = 5;
-
-// ---------------------------------------------------------------------------
-// Quantization: round4(x) * 10_000 as i16. The reference C evaluator rounds
-// every feature to 4 decimals (round-half-away-from-zero) before the k-NN, and
-// our i16 representation IS that value scaled by 10_000, so the i16 squared-L2
-// ordering is bit-identical to the evaluator's round4 f64 ordering.
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn quant_f64(x: f64) -> i16 {
@@ -45,10 +28,6 @@ fn quant_f32(x: f32) -> i16 {
     let r = if s >= 0.0 { s + 0.5 } else { s - 0.5 };
     r as i16
 }
-
-// ---------------------------------------------------------------------------
-// Date helpers (UTC ISO-8601 "YYYY-MM-DDTHH:MM:SSZ")
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn d2(s: &[u8], i: usize) -> i64 {
@@ -117,10 +96,6 @@ fn mcc_risk(mcc: &str) -> f64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test-data schema
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct TestData {
     entries: Vec<Entry>,
@@ -172,10 +147,6 @@ struct LastTx {
 fn known_contains(list: &[String], id: &str) -> bool {
     list.iter().any(|m| m == id)
 }
-
-// ---------------------------------------------------------------------------
-// Vectorizers — identical formulas, only the arithmetic precision differs.
-// ---------------------------------------------------------------------------
 
 fn vec_f64(r: &Req) -> [i16; DIM] {
     let amount = r.transaction.amount;
@@ -283,12 +254,8 @@ fn vec_f32(r: &Req) -> [i16; DIM] {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Exact brute-force k=5 NN, lowest-index tie-break. Returns fraud count in top5.
-// ---------------------------------------------------------------------------
-
 fn exact_fraud_count(q: &[i16; DIM], refs: &[i16], labels: &[u8]) -> u8 {
-    // top[t] = (dist, orig_index, label)
+
     let mut top = [(i64::MAX, u32::MAX, 0u8); KNN_K];
     let mut worst = 0usize;
     let n = labels.len();
@@ -325,10 +292,6 @@ fn exact_fraud_count(q: &[i16; DIM], refs: &[i16], labels: &[u8]) -> u8 {
     }
     top.iter().filter(|t| t.2 == 1).count() as u8
 }
-
-// ---------------------------------------------------------------------------
-// Reference loading (streaming, quantize on the fly into flat i16)
-// ---------------------------------------------------------------------------
 
 struct RefCollector {
     flat: Vec<i16>,
@@ -375,8 +338,6 @@ fn load_refs(path: &Path) -> std::io::Result<(Vec<i16>, Vec<u8>, usize)> {
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-// ---------------------------------------------------------------------------
-
 fn tally(name: &str, results: &[(bool, bool, bool)], elapsed: std::time::Duration) {
     let (mut fp, mut fn_, mut edge_total, mut edge_wrong) = (0usize, 0usize, 0usize, 0usize);
     for &(approved, expected, is_edge) in results {
@@ -387,8 +348,7 @@ fn tally(name: &str, results: &[(bool, bool, bool)], elapsed: std::time::Duratio
             if is_edge {
                 edge_wrong += 1;
             }
-            // FP = legit denied (expected approved, we denied)
-            // FN = fraud approved (expected denied, we approved)
+
             if expected {
                 fp += 1;
             } else {
@@ -401,8 +361,6 @@ fn tally(name: &str, results: &[(bool, bool, bool)], elapsed: std::time::Duratio
         "[{name}] FP={fp} FN={fn_} weighted_E={e} edge_wrong={edge_wrong}/{edge_total}  ({elapsed:?})"
     );
 }
-
-// ---- oracle mode: exact brute-force over raw refs, f32 vs f64 features ----
 
 fn run_oracle(entries: &[Entry], refs_path: &str) -> std::io::Result<()> {
     eprintln!("loading references from {refs_path} ...");
@@ -448,8 +406,6 @@ fn run_oracle(entries: &[Entry], refs_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// ---- runtime mode: real api search path (json parse + vectorizer + ivf) ----
-
 fn run_runtime(entries: &[Entry], index_path: &str) -> std::io::Result<()> {
     eprintln!("loading index from {index_path} ...");
     let ds = api::dataset::load(Path::new(index_path))?;
@@ -463,7 +419,6 @@ fn run_runtime(entries: &[Entry], index_path: &str) -> std::io::Result<()> {
         })
         .collect();
 
-    // Pre-vectorize once so the timing isolates search cost (the p99 driver).
     let queries: Vec<([f32; DIM], bool, bool)> = bodies
         .iter()
         .map(|(bytes, exp, is_edge)| {
@@ -472,7 +427,6 @@ fn run_runtime(entries: &[Entry], index_path: &str) -> std::io::Result<()> {
         })
         .collect();
 
-    // method: 0=exact, 1=gated, 3=probe-only (matches server SEARCH modes)
     let methods: &[(&str, u8)] = &[("exact", 0), ("probe-only", 3)];
     for &(name, m) in methods {
         let mut results = Vec::with_capacity(queries.len());

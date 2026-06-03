@@ -16,12 +16,6 @@ pub fn bind_ctrl_listener(path: &str, mode: u32) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Blocking recv of a single SCM_RIGHTS-passed FD from `ctrl_fd`.
-///
-/// Returns:
-///   `Ok(Some(fd))` — FD received
-///   `Ok(None)`     — peer closed the ctrl socket
-///   `Err(_)`       — recvmsg error (caller should sleep + retry)
 pub fn recv_fd(ctrl_fd: RawFd) -> io::Result<Option<RawFd>> {
     let mut payload = 0u8;
     let mut iov = libc::iovec {

@@ -11,12 +11,8 @@ const MAX_EVENTS: usize = 1024;
 const MAX_FD: usize = 65536;
 const PREWARM_ITERS: usize = 20_000;
 
-// Diagnostic search-mode toggle (env SEARCH): 0=exact (default), 1=gated, 2=null.
-// `null` skips the k-NN entirely to isolate server/scheduling latency from compute.
 static SEARCH_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-// Busy-poll microseconds (env BUSY_POLL_US), shared with set_socket_options for
-// per-socket SO_BUSY_POLL (works on older kernels than the epoll EPIOCSPARAMS).
 static BUSY_POLL_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[inline]
@@ -50,10 +46,6 @@ impl Conn {
     }
 }
 
-/// Single-issuer epoll reactor. One thread per API instance multiplexes the
-/// control socket (over which the load balancer hands us client FDs via
-/// SCM_RIGHTS) and every adopted client FD. No thread-per-connection, so no
-/// SCHED_FIFO oversubscription on the throttled CPU — the source of tail latency.
 pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
     SEARCH_MODE.store(cfg.search_mode, std::sync::atomic::Ordering::Relaxed);
     unsafe {
@@ -65,11 +57,6 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
 
     pin_and_prioritize(cfg.cpu_pin);
 
-    // Warm up BEFORE binding the control socket. The load balancer only gates
-    // /ready true once it has connected to every API's control socket, so by
-    // delaying the bind until after warmup we guarantee the evaluator never
-    // sends traffic to a cold API — the cold-start burst would otherwise land
-    // in the p99 tail on the slow evaluator hardware.
     prewarm(ds);
 
     let ctrl_path = format!("{}.ctrl", cfg.uds_path);
@@ -87,11 +74,6 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
     }
     epoll_add(epfd, ctrl_fd);
 
-    // Kernel busy-poll (env BUSY_POLL_US): make epoll_wait poll the socket's NAPI
-    // queue in-kernel for up to N us before sleeping, so an arriving request is
-    // picked up without an IRQ->softirq->wakeup->reschedule round trip. This is
-    // what the top teams use (with cpuset pinning) to kill the wakeup-latency tail
-    // under 2-core contention. No-op on kernels < 6.9 / drivers without NAPI poll.
     let busy_poll_us: u32 = std::env::var("BUSY_POLL_US")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -101,15 +83,11 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
         configure_busy_poll(epfd, busy_poll_us);
     }
 
-    // Userspace busy-poll window (env SPIN_US): complementary 0-timeout epoll_wait
-    // spin before blocking. 0 = rely on kernel busy-poll / block.
     let spin_us: u64 = std::env::var("SPIN_US")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Per-fd connection state, indexed by raw fd. ~512 KB of pointers; the 4 KB
-    // buffers are heap-allocated only for live connections.
     let mut conns: Vec<Option<Box<Conn>>> = (0..MAX_FD).map(|_| None).collect();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
 
@@ -132,8 +110,6 @@ pub fn run(cfg: Config, ds: &'static Dataset) -> io::Result<()> {
     }
 }
 
-/// One epoll wait: try a non-blocking poll first; if idle and spin_us>0, spin
-/// polling for up to spin_us microseconds; otherwise block indefinitely.
 #[inline]
 fn wait_events(epfd: RawFd, events: *mut libc::epoll_event, spin_us: u64) -> i32 {
     let n = unsafe { libc::epoll_wait(epfd, events, MAX_EVENTS as i32, 0) };
@@ -161,9 +137,6 @@ struct EpollParams {
     __pad: u8,
 }
 
-// EPIOCSPARAMS = _IOW(0x8A, 0x01, struct epoll_params), kernel >= 6.9.
-// `as _` coerces to whatever `ioctl`'s request arg is (c_ulong on glibc,
-// c_int on musl).
 const EPIOCSPARAMS: u64 = 0x4008_8A01;
 
 fn configure_busy_poll(epfd: RawFd, usecs: u32) {
@@ -191,8 +164,8 @@ fn accept_new_fds(ctrl_fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>]) 
                 conns[fd as usize] = Some(Conn::new());
                 epoll_add(epfd, fd);
             }
-            Ok(Some(_)) => {} // out-of-range fd; drop
-            Ok(None) => return, // would-block or peer closed: done draining
+            Ok(Some(_)) => {}
+            Ok(None) => return,
             Err(_) => return,
         }
     }
@@ -222,7 +195,7 @@ fn handle_client(fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>], ds: &'
             )
         };
         if n < 0 {
-            // EAGAIN/EWOULDBLOCK: drained for now.
+
             return;
         }
         if n == 0 {
@@ -235,12 +208,10 @@ fn handle_client(fd: RawFd, epfd: RawFd, conns: &mut [Option<Box<Conn>>], ds: &'
             close_conn(fd, epfd, conns);
             return;
         }
-        // Loop to drain any further bytes (level-triggered epoll).
+
     }
 }
 
-/// Process all complete requests currently buffered. Returns false if the
-/// connection must be closed.
 fn process_buffer(fd: RawFd, conns: &mut [Option<Box<Conn>>], ds: &'static Dataset) -> bool {
     let idx = fd as usize;
     loop {
@@ -332,7 +303,7 @@ fn send_all(fd: RawFd, data: &[u8]) -> bool {
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock {
-                continue; // tiny payload; socket buffer will drain immediately
+                continue;
             }
         }
         return false;
@@ -376,9 +347,7 @@ fn set_socket_options(fd: RawFd) {
         );
         let bp = BUSY_POLL_US.load(std::sync::atomic::Ordering::Relaxed) as libc::c_int;
         if bp > 0 {
-            // SO_BUSY_POLL: per-socket NAPI busy-poll (kernel >= 3.11), complements
-            // the epoll EPIOCSPARAMS busy-poll on kernels without it. Defined
-            // manually since libc may not expose it for all targets.
+
             const SO_BUSY_POLL: libc::c_int = 46;
             libc::setsockopt(
                 fd,
@@ -399,8 +368,7 @@ fn pin_and_prioritize(cpu_pin: Option<usize>) {
             libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
         }
     }
-    // SCHED_FIFO can interact badly with cgroup-v2 CPU quota (RT bandwidth
-    // throttling → tail jitter). Toggle via env to A/B against plain CFS.
+
     let sched = std::env::var("SCHED").unwrap_or_else(|_| "fifo".into());
     if sched == "fifo" {
         unsafe {

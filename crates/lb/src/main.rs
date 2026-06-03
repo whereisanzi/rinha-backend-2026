@@ -1,11 +1,4 @@
-// Minimal single-host TCP dispatcher: accepts on :PORT and hands each client FD
-// to a round-robin API instance over a UNIX control socket via SCM_RIGHTS. The
-// API then owns the FD and serves the connection directly (no per-request
-// proxying). Health checks (GET <HEALTH_PATH>) are answered here.
-//
-// Blocking accept loop only — the LB does per-connection work, not per-request,
-// so it needs no io_uring/epoll, and uses only syscalls in the default Docker
-// seccomp allowlist (io_uring_setup is blocked there).
+
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -91,17 +84,14 @@ mod linux {
         loop {
             let client_fd = unsafe { libc::accept(listen_fd, ptr::null_mut(), ptr::null_mut()) };
             if client_fd < 0 {
-                continue; // EINTR / ECONNABORTED / transient — retry
+                continue;
             }
 
             set_tcp_nodelay(client_fd);
 
             if let Some(path) = health_path.as_deref() {
                 if peek_is_health(client_fd, path) {
-                    // Only report ready once every API control socket is
-                    // connected. The APIs bind their control socket *after*
-                    // warmup, so this gates /ready on warm APIs and keeps the
-                    // evaluator from sending its opening burst to a cold backend.
+
                     if upstreams.iter().all(|u| u.ctrl_fd.load(Ordering::Acquire) >= 0) {
                         send_health_ok(client_fd);
                     }

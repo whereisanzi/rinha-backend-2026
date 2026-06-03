@@ -1,6 +1,6 @@
 services:
   lb:
-    image: ghcr.io/whereisanzi/rinha-lb:0d2f527
+    image: ghcr.io/whereisanzi/rinha-lb:ad8c8d5
     ports:
       - "9999:9999"
     environment:
@@ -27,7 +27,7 @@ services:
           memory: "20M"
 
   api1:
-    image: ghcr.io/whereisanzi/rinha-api:0d2f527
+    image: ghcr.io/whereisanzi/rinha-api:ad8c8d5
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api1.sock
@@ -37,6 +37,7 @@ services:
       - FAST_NPROBE=4
       - SCHED=other
       - SPIN_US=${SPIN_US:-0}
+      - BUSY_POLL_US=${BUSY_POLL_US:-0}
     volumes:
       - sockets:/sockets
     networks:
@@ -56,7 +57,7 @@ services:
           memory: "165M"
 
   api2:
-    image: ghcr.io/whereisanzi/rinha-api:0d2f527
+    image: ghcr.io/whereisanzi/rinha-api:ad8c8d5
     environment:
       - INDEX_PATH=/resources/index.bin
       - UDS_PATH=/sockets/api2.sock
@@ -66,6 +67,7 @@ services:
       - FAST_NPROBE=4
       - SCHED=other
       - SPIN_US=${SPIN_US:-0}
+      - BUSY_POLL_US=${BUSY_POLL_US:-0}
     volumes:
       - sockets:/sockets
     networks:
